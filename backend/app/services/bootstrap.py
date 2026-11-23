@@ -259,7 +259,7 @@ async def bootstrap_first_run() -> None:
                 db.add(
                     User(
                         email=settings.initial_admin_email,
-                        username="admin",
+                        username=settings.initial_admin_username,
                         full_name="Administrator",
                         hashed_password=hash_password(settings.initial_admin_password),
                         role=UserRole.ADMIN,

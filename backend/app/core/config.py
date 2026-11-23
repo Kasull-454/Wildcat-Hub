@@ -46,6 +46,8 @@ class Settings(BaseSettings):
 
     # ----- Initial admin ------------------------------------------------------
     initial_admin_email: str = "admin@example.com"
+    # Username of the first admin (sign-in still uses the e-mail).
+    initial_admin_username: str = Field(default="admin", min_length=3, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")
     initial_admin_password: str = "changeme_admin"
 
     # ----- Storage ------------------------------------------------------------
