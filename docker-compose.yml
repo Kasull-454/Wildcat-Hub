@@ -29,6 +29,8 @@ x-paths:
   keystores: &keystores ${WILDCAT_DATA:-./data}/keystores:/data/keystores
   backup: &backup ${WILDCAT_DATA:-./data}/backup-tmp:/data/backup-tmp
   tmp: &tmp ${WILDCAT_DATA:-./data}/tmp:/tmp
+  # flatpak/ostree scrivono anche qui (O_TMPFILE): rootfs read-only.
+  vartmp: &vartmp ${WILDCAT_DATA:-./data}/tmp:/var/tmp
   builder: &builder ${WILDCAT_DATA:-./data}/builder:/data/builder
 
 x-app-env: &app-env
@@ -150,6 +152,7 @@ services:
       - *backup
       # Upload e lettura dei bundle: su disco, non in RAM.
       - *tmp
+      - *vartmp
     # Solo loopback: l'API si fida di X-Forwarded-For.
     ports:
       - 127.0.0.1:${BACKEND_PORT:-8012}:8000
@@ -190,6 +193,7 @@ services:
       - *keystores
       - *backup
       - *tmp
+      - *vartmp
       # Legge i bundle prodotti dal builder.
       - *builder
     healthcheck:
