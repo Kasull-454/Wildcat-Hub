@@ -1,10 +1,21 @@
 # Branding
 
-- `icon-concept.webp` — bozza di riferimento (bossolo, stile synthwave). Non è l'icona definitiva.
-- `icon.png` — icona definitiva, 1024×1024 PNG con trasparenza ai bordi arrotondati. Da aggiungere.
+- `icon.png` — icona di Wildcat Hub (1024×1024, bossolo in stile synthwave, angoli trasparenti).
+- `icon-concept.webp` — originale da cui è ricavata.
 
-Quando l'icona definitiva è pronta:
+Dove viene usata (file generati da `icon.png`):
 
-1. salvala qui come `icon.png` (la usa il README);
-2. copiala in `frontend/app/icon.png`: Next.js la usa da sola come favicon e icona dell'app;
-3. facoltativo: caricala da *Amministrazione → Repository → Icona* per usarla anche come icona del remote Flatpak (`.flatpakrepo`).
+- `frontend/app/icon.png` (256 px) e `frontend/app/apple-icon.png` (180 px): favicon e icona dell'app;
+- `frontend/public/brand/icon-96.png` e `icon-192.png`: logo nell'intestazione e nel footer.
+
+Per cambiarla, sostituisci `icon.png` e rigenera:
+
+```bash
+magick branding/icon.png -resize 256x256 -strip frontend/app/icon.png
+magick branding/icon.png -resize 180x180 -strip frontend/app/apple-icon.png
+magick branding/icon.png -resize 96x96   -strip frontend/public/brand/icon-96.png
+magick branding/icon.png -resize 192x192 -strip frontend/public/brand/icon-192.png
+```
+
+Per usarla anche come icona del remote Flatpak (`.flatpakrepo`), caricala da
+*Amministrazione → Repository → Icona*.

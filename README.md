@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="branding/icon-concept.webp" width="160" alt="Wildcat Hub">
+  <img src="branding/icon.png" width="160" alt="Wildcat Hub">
 </p>
 
 # Wildcat-Hub

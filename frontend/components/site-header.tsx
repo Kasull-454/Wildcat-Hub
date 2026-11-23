@@ -121,9 +121,7 @@ export function SiteHeader() {
           className="flex shrink-0 items-center gap-2.5"
           aria-label={t("header.homeAriaLabel")}
         >
-          <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-brand-gradient text-[rgb(46_52_64)] shadow-e1">
-            <WildcatMark className="h-5 w-5" />
-          </span>
+          <BrandIcon />
           <span className="hidden text-base font-bold tracking-tight text-ink sm:inline">
             {t("header.brand")}
           </span>
@@ -377,14 +375,17 @@ export function SiteHeader() {
 }
 
 
-/* Wildcat mark: a cat head with a package box for a face. */
-export function WildcatMark({ className }: { className?: string }) {
+/* Wildcat Hub icon (branding/icon.png): the neon cartridge case. */
+export function BrandIcon({ size = 36 }: { size?: number }) {
   return (
-    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round" className={className} aria-hidden="true">
-      <path d="M4 9V3l4.5 3.5h7L20 3v6" />
-      <path d="M4 9c0 6 3.6 11 8 11s8-5 8-11" />
-      <path d="M8.5 12.5 12 14.5l3.5-2" />
-      <path d="M12 14.5V18" />
-    </svg>
+    // eslint-disable-next-line @next/next/no-img-element -- static export, no image optimizer
+    <img
+      src="/brand/icon-96.png"
+      srcSet="/brand/icon-96.png 1x, /brand/icon-192.png 2x"
+      width={size}
+      height={size}
+      alt=""
+      className="shrink-0 rounded-[22%] shadow-e1"
+    />
   );
 }

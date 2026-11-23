@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useTranslation } from "react-i18next";
 
 import pkg from "@/package.json";
-import { WildcatMark } from "@/components/site-header";
+import { BrandIcon } from "@/components/site-header";
 import { flatpakRepoFileUrl, useRepoInfo } from "@/lib/repo-store";
 
 export function SiteFooter() {
@@ -17,7 +17,7 @@ export function SiteFooter() {
         <div className="grid gap-8 md:grid-cols-[1.4fr_1fr_1fr]">
           <div>
             <div className="flex items-center gap-2.5">
-              <span className="flex h-9 w-9 items-center justify-center rounded-xl bg-brand-gradient text-[rgb(46_52_64)] shadow-e1"><WildcatMark className="h-5 w-5" /></span>
+              <BrandIcon />
               <span className="text-base font-bold tracking-tight text-ink">{t("header.brand")}</span>
             </div>
             <p className="mt-3 max-w-xs text-sm text-ink-soft">
