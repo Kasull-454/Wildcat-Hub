@@ -41,7 +41,7 @@ _DEFAULTS = {
     "gitea": "https://codeberg.org",
 }
 # GitHub release API max per_page = 100; we scan the first page only.
-_PER_PAGE = 30
+_PER_PAGE = 100
 
 # ``owner/name`` validated leniently. GitLab supports nested groups
 # (foo/bar/baz) — we tolerate one extra slash level for that case.
