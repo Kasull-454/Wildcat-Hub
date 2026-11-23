@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -42,6 +43,10 @@ def _env(gpg_home: str | Path | None = None) -> dict[str, str]:
         # CLI still resolves one; keep it on the writable tmpfs.
         "FLATPAK_USER_DIR": os.environ.get("FLATPAK_USER_DIR", "/tmp/flatpak-user"),
         "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", "/tmp"),
+        # libostree / flatpak default to /var/tmp for O_TMPFILE scratch
+        # files; on a read-only rootfs (Docker read_only) only the temp
+        # dir is writable, so point them at it.
+        "TMPDIR": tempfile.gettempdir(),
     }
     if gpg_home is not None:
         env["GNUPGHOME"] = str(gpg_home)
