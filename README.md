@@ -93,6 +93,32 @@ flatpak install wildcat <app.id>
 Per le app private, crea una chiave API dal tuo account e aggiungi il remote
 `https://<sito>/r/<chiave>/flatpak/wildcat.flatpakrepo`.
 
+## Deploy con le immagini della CI
+
+La GitHub Action [publish-images.yml](.github/workflows/publish-images.yml)
+compila le quattro immagini a ogni push su `main` (tag `latest` e
+`sha-<commit>`) e a ogni tag `vX.Y.Z` (tag `X.Y.Z` e `X.Y`). I test del
+backend girano prima della pubblicazione: se falliscono non viene
+pubblicato niente.
+
+Sul server, nel `.env`:
+
+```bash
+WILDCAT_IMAGE_PREFIX=ghcr.io/kasull-454/wildcat-hub
+WILDCAT_TAG=latest
+```
+
+poi:
+
+```bash
+docker compose pull
+docker compose up -d
+docker compose --profile builder up -d   # se usi le build da manifest
+```
+
+Se i pacchetti su GHCR sono privati, prima fai `docker login ghcr.io` con un
+token che abbia lo scope `read:packages`.
+
 ## Aggiornamenti e What's Up Docker
 
 Nel `docker-compose.yml` ogni servizio ha le label `wud.*` commentate.
