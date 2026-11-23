@@ -292,7 +292,7 @@ services:
       - /var/cache/nginx:rw,size=64m,uid=101,gid=101,mode=0700
       - /etc/nginx/conf.d:rw,size=4m,uid=101,gid=101,mode=0755
     ports:
-      - ${FRONTEND_PORT:-8096}:8080
+      - ${FRONTEND_PORT:-8098}:8080
     volumes:
       - ${WILDCAT_STORAGE:-./storage}:/data/storage:ro
     depends_on:
