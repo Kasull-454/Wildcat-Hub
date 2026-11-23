@@ -2,7 +2,7 @@
   <img src="branding/icon-concept.webp" width="160" alt="Wildcat Hub">
 </p>
 
-# Wildcat Hub
+# Wildcat-Hub
 
 Repository Flatpak self-hosted con interfaccia web.
 
