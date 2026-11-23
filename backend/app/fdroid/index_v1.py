@@ -1,0 +1,254 @@
+"""Generate F-Droid index-v1 (legacy, but widely supported by F-Droid clients).
+
+Spec reference:
+https://gitlab.com/fdroid/fdroidserver/-/blob/master/fdroidserver/index.py
+
+The result is a JSON object that gets packed into ``index-v1.jar``, then
+JAR-signed using the repo keystore.
+"""
+from __future__ import annotations
+
+import json
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from typing import Any
+
+from app.fdroid.donations import funding_for
+from app.models.apk import Apk
+from app.models.app import App
+from app.models.repo_config import RepoConfig
+
+
+F_DROID_INDEX_VERSION = 20002  # matches what fdroidserver writes
+DEFAULT_LOCALE = "en-US"
+
+
+def _ts_ms(value: datetime | None) -> int:
+    if value is None:
+        return int(datetime.now(UTC).timestamp() * 1000)
+    return int(value.timestamp() * 1000)
+
+
+def suggestion_fallback(app: App, published: list[Apk]) -> Apk | None:
+    """The APK to suggest instead of ``app.suggested_version_code`` when that
+    pin matches none of the ``published`` APKs this index carries — a manual
+    pin left dangling after its APK was deleted or rejected. ``None`` when
+    the pin is fine, or unset (no stable baseline: nothing is held back).
+
+    The fallback is the automatic rule of
+    ``app.services.suggested_version.recompute_auto``: the newest published
+    non-beta APK, else the newest. Without it v1 clients are pointed at a
+    version that isn't there, and v2 marks every version above the stale
+    pin as Beta.
+    """
+    code = app.suggested_version_code
+    if code is None or any(a.version_code == code for a in published):
+        return None
+    pool = [a for a in published if not a.is_beta] or published
+    return max(pool, key=lambda a: a.version_code, default=None)
+
+
+def _serialize_app(app: App, published: list[Apk]) -> dict[str, Any]:
+    obj: dict[str, Any] = {
+        "added": _ts_ms(app.first_published_at or app.created_at),
+        "name": app.name,
+        "packageName": app.package_name,
+        "lastUpdated": _ts_ms(app.last_published_at or app.updated_at),
+    }
+    if app.summary:
+        obj["summary"] = app.summary
+    if app.description:
+        obj["description"] = app.description
+    # fdroidserver omits "Unknown" license rather than emitting it
+    if app.license and app.license != "Unknown":
+        obj["license"] = app.license
+    cats = [c.name for c in app.categories]
+    if cats:
+        obj["categories"] = cats
+    fallback = suggestion_fallback(app, published)
+    suggested_code = fallback.version_code if fallback else app.suggested_version_code
+    suggested_name = fallback.version_name if fallback else app.suggested_version_name
+    if suggested_code:
+        obj["suggestedVersionCode"] = str(suggested_code)
+    if suggested_name:
+        obj["suggestedVersionName"] = suggested_name
+    if app.author_name:
+        obj["authorName"] = app.author_name
+    if app.author_email:
+        obj["authorEmail"] = app.author_email
+    if app.website:
+        obj["webSite"] = app.website
+    if app.source_code:
+        obj["sourceCode"] = app.source_code
+    if app.issue_tracker:
+        obj["issueTracker"] = app.issue_tracker
+    if app.translation:
+        obj["translation"] = app.translation
+    # v1 keeps ``donate`` as a single URL; the platform fields are bare IDs
+    # here too (the client builds the links) — see ``app.fdroid.donations``.
+    funding = funding_for(app)
+    if funding.donate:
+        obj["donate"] = funding.donate[0]
+    if funding.liberapay:
+        obj["liberapay"] = funding.liberapay
+    if funding.bitcoin:
+        obj["bitcoin"] = funding.bitcoin
+    if funding.open_collective:
+        obj["openCollective"] = funding.open_collective
+    if app.icon_path:
+        # F-Droid v1 clients expect just the basename of an icon stored under
+        # ``<repo-url>/icons/<filename>``.
+        obj["icon"] = app.icon_path.split("/")[-1]
+
+    # Localized block (v1 keys locales at the app level, not per version):
+    #   - name/summary/description/video: per-locale overrides on top of the
+    #     en-US defaults (those still live at the obj root for v1 clients
+    #     that don't read the localized block).
+    #   - whatsNew: taken from the highest-versionCode published APK that has
+    #     one. F-Droid clients display it as "What's new in <latest>".
+    #   - phoneScreenshots: list of basenames; the client builds the full URL
+    #     ``<repo-url>/<package>/<locale>/phoneScreenshots/<basename>``.
+    localized: dict[str, dict[str, Any]] = {}
+
+    for loc in app.localizations:
+        bucket = localized.setdefault(loc.locale, {})
+        if loc.name:
+            bucket["name"] = loc.name
+        if loc.summary:
+            bucket["summary"] = loc.summary
+        if loc.description:
+            bucket["description"] = loc.description
+        if loc.video:
+            bucket["video"] = loc.video
+
+    shots_by_locale: dict[str, list[str]] = {}
+    for s in app.screenshots:
+        shots_by_locale.setdefault(s.locale, []).append(s.storage_key.rsplit("/", 1)[-1])
+    for locale, files in shots_by_locale.items():
+        localized.setdefault(locale, {})["phoneScreenshots"] = files
+
+    # Featured / promo / TV banner are all stored at
+    # ``<package>/<locale>/<filename>.png``; v1 expects just the basename
+    # inside the per-locale block (the client rebuilds the URL using the
+    # app's package + the locale key).
+    for path, key_in_block in (
+        (app.feature_graphic_path, "featureGraphic"),
+        (app.promo_graphic_path, "promoGraphic"),
+        (app.tv_banner_path, "tvBanner"),
+    ):
+        if not path:
+            continue
+        basename = path.rsplit("/", 1)[-1]
+        parts = path.split("/")
+        locale = parts[-2] if len(parts) >= 2 else DEFAULT_LOCALE
+        localized.setdefault(locale, {})[key_in_block] = basename
+
+    # v1 only carries a single whatsNew per app per locale, so we pick the
+    # highest-versionCode published APK that has any release notes and lay
+    # each of its locale entries into the matching ``localized`` bucket.
+    latest_with_notes = next(
+        iter(
+            sorted(
+                (a for a in app.apks if a.status.value == "published" and a.whats_new),
+                key=lambda a: a.version_code,
+                reverse=True,
+            )
+        ),
+        None,
+    )
+    if latest_with_notes:
+        for locale, text in (latest_with_notes.whats_new or {}).items():
+            if not text:
+                continue
+            localized.setdefault(locale, {})["whatsNew"] = text
+
+    if localized:
+        obj["localized"] = localized
+    return obj
+
+
+def _serialize_apk(apk: Apk, app: App) -> dict[str, Any]:
+    """Serialize an APK row to the v1 ``packages[<pkg>]`` entry format.
+
+    Notes:
+      * ``hash`` / ``hashType`` are the APK file content hash.
+      * ``signer`` is the SHA-256 of the signing certificate (lowercase hex).
+      * fdroidserver no longer emits ``sig`` (the legacy MD5 cert hash), so
+        we don't either — modern F-Droid clients use ``signer``.
+    """
+    obj: dict[str, Any] = {
+        "added": _ts_ms(apk.published_at or apk.created_at),
+        "apkName": apk.file_name,
+        "hash": apk.sha256,
+        "hashType": "sha256",
+        "minSdkVersion": apk.min_sdk or 0,
+        "packageName": app.package_name,
+        "signer": apk.signer_sha256,
+        "size": apk.size_bytes,
+        # targetSdkVersion defaults to minSdkVersion when not declared
+        "targetSdkVersion": apk.target_sdk or apk.min_sdk or 0,
+        "versionCode": apk.version_code,
+        "versionName": apk.version_name,
+    }
+    if apk.max_sdk:
+        obj["maxSdkVersion"] = apk.max_sdk
+    if apk.native_code:
+        obj["nativecode"] = list(apk.native_code)
+    if apk.permissions:
+        # F-Droid v1 expects ``[[<permission>, <max_sdk_or_null>], ...]``.
+        obj["uses-permission"] = [[p, None] for p in apk.permissions]
+    if apk.features:
+        obj["features"] = list(apk.features)
+    if apk.anti_features:
+        # v1 emits anti-features as a flat list of label strings per APK; the
+        # client renders the corresponding badge ("Tracking", "NonFreeNet"…).
+        obj["antiFeatures"] = list(apk.anti_features)
+    return obj
+
+
+def build_index_v1(
+    *,
+    repo_config: RepoConfig,
+    apps: Iterable[App],
+    mirrors: list[str] | None = None,
+    timestamp_ms: int | None = None,
+) -> bytes:
+    """Return the index-v1.json content as UTF-8 bytes.
+
+    Only apps with at least one PUBLISHED apk are emitted. Apps with no APK
+    are silently skipped (the index would not be useful without binaries).
+
+    ``timestamp_ms`` lets the caller pin the repo timestamp so a single
+    rebuild stamps v1, v2 and entry.json identically. Falls back to
+    ``now()`` only when called standalone.
+    """
+    now_ms = timestamp_ms if timestamp_ms is not None else int(datetime.now(UTC).timestamp() * 1000)
+    apps_list: list[dict[str, Any]] = []
+    packages: dict[str, list[dict[str, Any]]] = {}
+
+    for app in apps:
+        published = [a for a in app.apks if a.status.value == "published"]
+        if not published:
+            continue
+        apps_list.append(_serialize_app(app, published))
+        packages[app.package_name] = [_serialize_apk(a, app) for a in published]
+
+    repo_block: dict[str, Any] = {
+        "timestamp": now_ms,
+        "version": F_DROID_INDEX_VERSION,
+        "name": repo_config.name,
+        "icon": (repo_config.icon_path or "").split("/")[-1] or "fdroid-icon.png",
+        "address": repo_config.address,
+        "description": repo_config.description or "",
+    }
+    # v1 mirrors are a list of URL strings (not dicts like v2); omit if empty
+    if mirrors:
+        repo_block["mirrors"] = list(mirrors)
+
+    payload: dict[str, Any] = {
+        "repo": repo_block,
+        "requests": {"install": [], "uninstall": []},
+        "apps": apps_list,
+        "packages": packages,
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")

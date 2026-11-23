@@ -1,0 +1,579 @@
+"""arq worker tasks.
+
+Run with::
+
+    python -m arq app.workers.tasks.WorkerSettings
+
+Available jobs:
+  * ``rebuild_index`` — regenerate index-v1.jar / index-v2.json / entry.jar for
+    both the public and the private repo variants.
+  * ``scan_apks_periodic`` — opt-in cron job that rescans every PUBLISHED apk
+    against clamd (no-op unless ``RepoConfig.clamav_scan_periodic`` is on).
+  * ``scan_github_sources_periodic`` — daily coordinator that enqueues a
+    ``fetch_github_source`` per enabled :class:`GithubSource`.
+  * ``fetch_github_source`` — poll one GitHub repo and import the latest
+    matching release as a new APK.
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import uuid
+from datetime import UTC, datetime, timedelta
+
+from arq import Retry, cron
+from arq.connections import RedisSettings
+from redis.asyncio.lock import Lock
+from sqlalchemy import desc, select
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import selectinload
+
+from app.core.config import settings
+from app.core.database import SessionLocal
+from app.core.logging import configure_logging, get_logger
+from app.flatpak.repo_builder import rebuild_repo_index
+from app.models.apk import Apk, ApkStatus
+from app.models.apk_scan import ApkScan, ApkScanStatus
+from app.models.app import App
+from app.models.github_source import GithubSource, GithubSourceStatus
+from app.models.repo_config import RepoConfig
+from app.services.queue import REINDEX_DIRTY_KEY, REINDEX_LOCK_KEY, REINDEX_QUEUED_KEY
+from app.storage import get_storage
+from app.storage.local import LocalStorage
+
+log = get_logger(__name__)
+
+
+# Single-flight index rebuild: the lock is held for the whole build and
+# refreshed while it runs, so a crashed worker frees it within a TTL.
+_REINDEX_LOCK_TTL = 120
+# How long a second rebuild job waits for the running one before retrying.
+_REINDEX_LOCK_WAIT = 900
+
+
+async def _keep_lock(lock: Lock) -> None:
+    while True:
+        await asyncio.sleep(_REINDEX_LOCK_TTL / 3)
+        try:
+            await lock.reacquire()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("rebuild_index lock refresh failed", error=str(exc))
+            return
+
+
+async def rebuild_index(ctx: dict, force: bool = False) -> dict:
+    """Regenerate every index variant — one build at a time.
+
+    ``enqueue_reindex`` marks the index dirty after each committed change.
+    The job takes the dirty flag *before* reading the database, so a change
+    committed during the build re-marks it and its own (queued) job
+    rebuilds; a job that finds the flag already consumed by an earlier build
+    has nothing new to publish. Concurrent jobs wait on the lock instead of
+    writing the same index files at the same time.
+    """
+    redis = ctx["redis"]
+    await redis.delete(REINDEX_QUEUED_KEY)
+    lock = redis.lock(
+        REINDEX_LOCK_KEY, timeout=_REINDEX_LOCK_TTL, blocking_timeout=_REINDEX_LOCK_WAIT
+    )
+    if not await lock.acquire():
+        raise Retry(defer=30)
+    keepalive = asyncio.create_task(_keep_lock(lock))
+    try:
+        dirty = await redis.getdel(REINDEX_DIRTY_KEY)
+        if dirty is None and not force:
+            return {"ok": True, "skipped": "index already up to date"}
+        async with SessionLocal() as db:
+            try:
+                await rebuild_repo_index(db)
+                await db.commit()
+            except Exception as exc:
+                await db.rollback()
+                # Leave the work for the retry / next job.
+                await redis.set(REINDEX_DIRTY_KEY, "1")
+                log.exception("rebuild_index failed", error=str(exc))
+                # arq only re-runs a job that raises Retry (bounded by
+                # max_tries); a plain exception would leave the index stale
+                # until some unrelated change enqueues the next build.
+                raise Retry(defer=30) from exc
+        return {"ok": True}
+    finally:
+        keepalive.cancel()
+        with contextlib.suppress(Exception):
+            await lock.release()
+
+
+async def scan_apks_periodic(ctx: dict, force: bool = False) -> dict:
+    """Re-scan every PUBLISHED apk whose last scan is older than 24h.
+
+    No-op when clamd isn't configured at the env level or when the
+    storage backend isn't ``LocalStorage`` (S3 + scan in-place would
+    need a separate fetch pipeline — out of scope for now).
+
+    The ``clamav_scan_periodic`` admin toggle gates the *recurring* cron
+    run; manual triggers from /admin/scans set ``force=True`` so an
+    operator can validate the setup before flipping the daily switch on.
+    """
+    if not settings.clamav_available:
+        log.info("scan_apks_periodic skipped: CLAMAV_HOST not set")
+        return {"skipped": "clamav_not_configured"}
+
+    from app.services.clamav import scan_path
+
+    storage = get_storage()
+    if not isinstance(storage, LocalStorage):
+        log.info("scan_apks_periodic skipped: non-local storage")
+        return {"skipped": "non_local_storage"}
+
+    async with SessionLocal() as db:
+        config = (await db.execute(select(RepoConfig).limit(1))).scalar_one_or_none()
+        if not force and (config is None or not config.clamav_scan_periodic):
+            log.info("scan_apks_periodic skipped: admin toggle off")
+            return {"skipped": "disabled"}
+
+        cutoff = datetime.now(UTC) - timedelta(hours=24)
+        # Pull every PUBLISHED apk; client-side filter by latest-scan-time
+        # so the SQL stays simple. The repo isn't large enough for the
+        # extra trip to matter.
+        apks = (
+            await db.execute(
+                select(Apk).where(Apk.status == ApkStatus.PUBLISHED)
+            )
+        ).scalars().all()
+        scanned = 0
+        infected = 0
+        errors = 0
+        for apk in apks:
+            latest = (
+                await db.execute(
+                    select(ApkScan)
+                    .where(ApkScan.apk_id == apk.id)
+                    .order_by(desc(ApkScan.created_at))
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
+            # Manual triggers rescan everything; cron runs only refresh
+            # rows older than 24h (or never-scanned).
+            if not force and latest is not None and latest.created_at >= cutoff:
+                continue
+            try:
+                local = storage.local_path(apk.storage_key)
+            except Exception:
+                continue
+            if not local.exists():
+                continue
+            row = ApkScan(
+                apk_id=apk.id,
+                scanner="clamav",
+                scanned_at=datetime.now(UTC),
+            )
+            try:
+                result = await scan_path(local)
+            except Exception as exc:  # noqa: BLE001 — one APK must not sink the whole run
+                log.warning("periodic scan failed", apk_id=str(apk.id), error=str(exc))
+                row.status = ApkScanStatus.ERROR
+                row.error = f"scan failed: {exc}"[:1000]
+            else:
+                if result.clean:
+                    row.status = ApkScanStatus.CLEAN
+                elif result.signature:
+                    row.status = ApkScanStatus.INFECTED
+                    row.signatures = result.signature
+                else:
+                    row.status = ApkScanStatus.ERROR
+                    row.error = result.error
+            db.add(row)
+            # One commit per APK: the verdicts already obtained survive a
+            # later failure (or a worker restart) in the middle of the run.
+            try:
+                await db.commit()
+            except SQLAlchemyError as exc:
+                await db.rollback()
+                log.warning("could not record scan", apk_id=str(apk.id), error=str(exc))
+                continue
+            scanned += 1
+            if row.status == ApkScanStatus.INFECTED:
+                infected += 1
+            elif row.status == ApkScanStatus.ERROR:
+                errors += 1
+        log.info(
+            "scan_apks_periodic complete",
+            scanned=scanned,
+            infected=infected,
+            errors=errors,
+        )
+        return {"scanned": scanned, "infected": infected, "errors": errors}
+
+
+async def scan_github_sources_periodic(ctx: dict) -> dict:
+    """Coordinator: enqueue a per-source scan for every enabled GitHub source.
+
+    We deliberately split the work into one job per repo so each scan
+    appears individually in /admin/jobs and a failing source doesn't
+    take down the others. Disabled sources are skipped — flipping the
+    toggle is the supported way to pause auto-imports without losing
+    the configuration.
+    """
+    from arq import create_pool
+
+    async with SessionLocal() as db:
+        sources = (
+            await db.execute(
+                select(GithubSource).where(GithubSource.enabled.is_(True))
+            )
+        ).scalars().all()
+
+    if not sources:
+        log.info("scan_github_sources: nothing to do")
+        return {"queued": 0}
+
+    # The job id carries the day: it dedupes a re-run of today's
+    # coordinator, while a fixed id would collide with yesterday's result
+    # (kept ``keep_result`` = 24h) and arq would silently drop the enqueue.
+    day = datetime.now(UTC).strftime("%Y%m%d")
+    pool = await create_pool(RedisSettings.from_dsn(settings.redis_url))
+    try:
+        queued = 0
+        for s in sources:
+            sid = str(s.id)
+            job = await pool.enqueue_job(
+                "fetch_github_source",
+                sid,
+                _job_id=f"fetch_github_source:{sid}:{day}",
+            )
+            if job is not None:
+                queued += 1
+    finally:
+        await pool.close()
+    log.info("scan_github_sources queued", queued=queued)
+    return {"queued": queued}
+
+
+async def fetch_github_source(ctx: dict, source_id: str, force: bool = False) -> dict:
+    """Poll one GitHub repo and import the latest matching release.
+
+    The result dict is what the admin sees in /admin/jobs (Recent runs).
+    We aim to keep it short and human-readable: status (imported / up-to-date
+    / skipped / error), tag, asset name, version_code when applicable.
+
+    Errors are persisted on the source row (``last_status=ERROR``,
+    ``last_error=<msg>``) so the user sees them on their app page even
+    after the job result has rotated out of redis.
+    """
+    from app.api.v1.apks import attach_apk_to_app, parse_or_400
+    from app.services.audit import write_event
+    from app.services.github_releases import (
+        GithubReleaseError,
+        download_asset,
+        find_latest_asset,
+    )
+    from app.services.queue import enqueue_reindex
+
+    try:
+        sid = uuid.UUID(source_id)
+    except ValueError:
+        log.warning("fetch_github_source: invalid source_id", source_id=source_id)
+        return {"status": "error", "error": "invalid source id"}
+
+    async with SessionLocal() as db:
+        source = (
+            await db.execute(
+                select(GithubSource)
+                .options(selectinload(GithubSource.app).selectinload(App.apks))
+                .where(GithubSource.id == sid)
+            )
+        ).scalar_one_or_none()
+        if source is None:
+            log.warning("fetch_github_source: source vanished", source_id=source_id)
+            return {"status": "error", "error": "source not found"}
+        app = source.app
+        if app is None:
+            return {"status": "error", "error": "app not found"}
+
+        # Re-fetch owner separately so attach_apk_to_app has a uploader.
+        from app.models.user import User
+        owner = None
+        if app.owner_id is not None:
+            owner = (
+                await db.execute(select(User).where(User.id == app.owner_id))
+            ).scalar_one_or_none()
+        if owner is None:
+            await _mark_source_error(
+                db, source, "App has no owner — cannot attribute uploads"
+            )
+            await db.commit()
+            return {"status": "error", "error": "app owner missing"}
+
+        # Manifest sources are built by the builder container, not
+        # downloaded: hand them off and let ``ingest_built_bundle`` finish.
+        if source.kind != "release":
+            from app.workers.build_tasks import dispatch_manifest_build
+
+            return await dispatch_manifest_build(db, source, app, force=force)
+
+        # Decrypt the per-source token. ``decrypt`` returns None when
+        # the blob is empty or the key has rotated — both paths fall
+        # through to the env-var default inside ``find_latest_asset``.
+        from app.services.crypto import decrypt as _decrypt
+
+        per_source_token = _decrypt(source.access_token_encrypted)
+
+        # ---- 1. Probe the forge for the latest eligible release --------
+        try:
+            asset = await find_latest_asset(
+                source.repo,
+                asset_pattern=source.asset_pattern,
+                include_prereleases=source.include_prereleases,
+                provider=source.provider.value,
+                base_url=source.base_url,
+                token=per_source_token,
+            )
+        except GithubReleaseError as exc:
+            await _mark_source_error(db, source, str(exc))
+            await db.commit()
+            return {"status": "error", "repo": source.repo, "error": str(exc)}
+
+        source.last_scanned_at = datetime.now(UTC)
+
+        if asset is None:
+            source.last_status = GithubSourceStatus.UP_TO_DATE
+            source.last_error = None
+            await db.commit()
+            log.info("fetch_github_source: no matching release", repo=source.repo)
+            return {"status": "up_to_date", "repo": source.repo, "note": "no matching asset"}
+
+        # Already imported this exact tag — no-op.
+        if source.last_release_tag == asset.release_tag:
+            source.last_status = GithubSourceStatus.UP_TO_DATE
+            source.last_error = None
+            source.last_release_published_at = asset.release_published_at
+            await db.commit()
+            return {
+                "status": "up_to_date",
+                "repo": source.repo,
+                "tag": asset.release_tag,
+            }
+
+        # ---- 2. Download the asset to a tmpfile ------------------------
+        config = (await db.execute(select(RepoConfig).limit(1))).scalar_one_or_none()
+        cap_bytes = (config.upload_max_apk_mb if config else 200) * 1024 * 1024
+        try:
+            tmp_path = await download_asset(asset, max_bytes=cap_bytes)
+        except GithubReleaseError as exc:
+            await _mark_source_error(db, source, f"Download failed: {exc}")
+            await db.commit()
+            return {"status": "error", "repo": source.repo, "error": str(exc)}
+
+        # ---- 3. Parse + persist as an APK (same path as manual upload) -
+        try:
+            try:
+                meta = await parse_or_400(tmp_path)
+            except Exception as exc:  # noqa: BLE001
+                await _mark_source_error(
+                    db, source, f"Bundle parsing failed: {getattr(exc, 'detail', str(exc))}"
+                )
+                await db.commit()
+                return {"status": "error", "repo": source.repo, "error": "parse_failed"}
+
+            # Pre-flight: same version_code already in this app? Mark
+            # imported tag so we don't loop forever on a known release.
+            already_present = any(a.version_code == meta.version_code for a in app.apks)
+            if already_present:
+                source.last_status = GithubSourceStatus.SKIPPED
+                source.last_release_tag = asset.release_tag
+                source.last_release_published_at = asset.release_published_at
+                source.last_error = (
+                    f"Release {asset.release_tag} skipped: versionCode "
+                    f"{meta.version_code} already exists in this app"
+                )
+                await db.commit()
+                return {
+                    "status": "skipped",
+                    "repo": source.repo,
+                    "tag": asset.release_tag,
+                    "reason": "version_code_present",
+                }
+
+            try:
+                # A forge pre-release lands on the F-Droid Beta channel:
+                # only users who allowed beta updates for the app get it.
+                apk = await attach_apk_to_app(
+                    db,
+                    app=app,
+                    tmp_path=tmp_path,
+                    meta=meta,
+                    uploader=owner,
+                    is_beta=asset.is_prerelease,
+                )
+            except Exception as exc:  # noqa: BLE001
+                detail = getattr(exc, "detail", None) or str(exc)
+                await _mark_source_error(db, source, f"Import rejected: {detail}")
+                await write_event(
+                    db,
+                    action="github_source.import_failed",
+                    actor=None,
+                    target_type="app",
+                    target_id=app.id,
+                    summary=f"Import from {source.repo} ({asset.release_tag}) rejected",
+                    payload={"repo": source.repo, "tag": asset.release_tag, "error": detail},
+                )
+                await db.commit()
+                return {"status": "error", "repo": source.repo, "error": detail}
+
+            source.last_status = GithubSourceStatus.IMPORTED
+            source.last_release_tag = asset.release_tag
+            source.last_release_published_at = asset.release_published_at
+            source.last_error = None
+
+            # Retention enforcement — same hook as the manual upload
+            # path so the worker can't grow an app unbounded by
+            # cron-driven imports.
+            from app.services.apk_eviction import evict_oldest_if_needed
+            await evict_oldest_if_needed(db, app=app, actor_id=owner.id, keep=apk.id)
+
+            await write_event(
+                db,
+                action="github_source.imported",
+                actor=None,
+                target_type="app",
+                target_id=app.id,
+                summary=(
+                    f"Imported {asset.asset_name} from {source.repo} "
+                    f"({asset.release_tag}) as versionCode {meta.version_code}"
+                ),
+                payload={
+                    "repo": source.repo,
+                    "tag": asset.release_tag,
+                    "asset": asset.asset_name,
+                    "version_code": meta.version_code,
+                    "version_name": meta.version_name,
+                },
+            )
+            await db.commit()
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    # Index rebuild outside of the DB transaction to keep the row commit
+    # tight. Best-effort: a stale index gets refreshed on the next change.
+    if apk.status == ApkStatus.PUBLISHED:
+        await enqueue_reindex()
+
+    return {
+        "status": "imported",
+        "repo": source.repo,
+        "tag": asset.release_tag,
+        "asset": asset.asset_name,
+        "version_code": meta.version_code,
+    }
+
+
+async def _mark_source_error(db, source: GithubSource, message: str) -> None:
+    """Record a failure on the source row. Caller commits."""
+    source.last_status = GithubSourceStatus.ERROR
+    source.last_error = (message or "")[:2000]
+    source.last_scanned_at = datetime.now(UTC)
+
+
+async def startup(ctx: dict) -> None:
+    configure_logging()
+    log.info("arq worker starting", redis=settings.redis_url)
+
+
+async def shutdown(ctx: dict) -> None:
+    log.info("arq worker shutting down")
+
+
+async def purge_stale_staging(ctx: dict) -> dict:
+    """Delete staged uploads (``/apks/inspect``) nobody redeemed: they
+    outlive their one-hour staging token otherwise and pile up in storage
+    without counting against any quota."""
+    from app.core.download_token import _STAGING_DEFAULT_TTL
+
+    storage = get_storage()
+    cutoff = datetime.now(UTC) - timedelta(seconds=_STAGING_DEFAULT_TTL + 600)
+    deleted = 0
+    for key, modified in await storage.list_prefix("staging/"):
+        if modified < cutoff:
+            try:
+                await storage.delete(key)
+                deleted += 1
+            except Exception as exc:  # noqa: BLE001
+                log.warning("could not purge staged upload", key=key, error=str(exc))
+    return {"deleted": deleted}
+
+
+from app.workers.backup_tasks import (
+    cleanup_expired_backups,
+    run_backup_job,
+    run_restore_job,
+)
+from app.workers.build_tasks import ingest_built_bundle
+from app.workers.cve_tasks import scan_apk_cve
+from app.workers.proxy_tasks import (
+    fetch_apk_proxy_source,
+    scan_apk_proxy_sources_periodic,
+)
+
+
+class WorkerSettings:
+    functions = [
+        rebuild_index,
+        scan_apks_periodic,
+        scan_github_sources_periodic,
+        fetch_github_source,
+        # Flatpak manifest builds: the builder container hands finished
+        # bundles back through this job (see app/workers/build_tasks.py).
+        ingest_built_bundle,
+        # Admin backup feature — actual work runs out-of-band so the
+        # API stays responsive on multi-GB repos. See
+        # ``app/workers/backup_tasks.py`` for the per-task semantics.
+        run_backup_job,
+        run_restore_job,
+        cleanup_expired_backups,
+        purge_stale_staging,
+        # Per-APK SBOM + CVE scanning via trivy. Auto-enqueued when
+        # an APK reaches PARSED; short-circuits when the feature is
+        # disabled in RepoConfig.
+        scan_apk_cve,
+        # APK source proxy pipeline. Coordinator runs alongside the
+        # GitHub one (different cron slot) so cold starts don't bunch.
+        scan_apk_proxy_sources_periodic,
+        fetch_apk_proxy_source,
+    ]
+    # Run the rescan at 03:00 UTC every day. The function short-circuits
+    # at the top when the feature is off, so leaving the cron registered
+    # is safe even on deployments that never enable it.
+    # GitHub scan runs at 04:00 UTC to spread the load away from clamav.
+    # Backup cleanup runs hourly at :30 (off-peak vs. the scans above).
+    cron_jobs = [
+        cron(scan_apks_periodic, hour={3}, minute={0}, run_at_startup=False),
+        cron(scan_github_sources_periodic, hour={4}, minute={0}, run_at_startup=False),
+        # Proxy sources at 05:00 UTC — same hourly rhythm as forges, an
+        # hour later so dial-out bursts don't overlap on a slow uplink.
+        cron(scan_apk_proxy_sources_periodic, hour={5}, minute={0}, run_at_startup=False),
+        cron(cleanup_expired_backups, minute={30}, run_at_startup=False),
+        cron(purge_stale_staging, minute={45}, run_at_startup=False),
+    ]
+    redis_settings = RedisSettings.from_dsn(settings.redis_url)
+    on_startup = startup
+    on_shutdown = shutdown
+    # rebuild_index is coalesced at enqueue time and single-flight (redis
+    # lock), so a second slot never runs two builds at once.
+    max_jobs = 2
+    # Backups on large repos can run for tens of minutes; bump the timeout
+    # generously so a real-world repo finishes inside one job lifetime.
+    # The cancel flag stays the operator's escape hatch for unresponsive runs.
+    job_timeout = 3600
+    # Keep finished-job results in Redis for 24h so the admin "Recent runs"
+    # page survives restarts and idle periods. 30s (the prior value) made
+    # the history vanish almost immediately after every run.
+    keep_result = 86400
+    # Refresh the health-check key every minute (arq's default is hourly,
+    # with a TTL of interval + 1 s): the compose healthcheck runs
+    # ``arq --check`` every 30 s and must see a dead worker within minutes.
+    health_check_interval = 60
+    # Pick at most one job per poll. With a bigger batch, arq's poll loop
+    # waits on the job semaphore whenever more jobs are queued than slots
+    # are free (the daily source fan-out) and neither refreshes the health
+    # key nor runs crons until the batch is started.
+    queue_read_limit = 1

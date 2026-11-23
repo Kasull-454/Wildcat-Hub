@@ -1,0 +1,595 @@
+"""Business logic for authentication: login, refresh, OIDC linking."""
+from __future__ import annotations
+
+import re
+import secrets
+import uuid
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.config import settings
+from app.core.security import (
+    create_access_token,
+    create_refresh_token,
+    decode_token,
+    hash_password,
+    verify_password,
+)
+from app.models.invite_code import InviteCode
+from app.models.refresh_token import RefreshToken
+from app.models.repo_config import RepoConfig
+from app.models.user import AuthProvider, User, UserRole
+
+
+class AuthError(Exception):
+    """Raised when an auth operation cannot complete (bad creds, disabled, ...).
+
+    ``code`` is a stable identifier the SSO callback passes to the SPA
+    (``/login?oidc_error=<code>``) instead of the message text.
+    """
+
+    def __init__(self, message: str, code: str = "auth_failed") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# Precomputed argon2 hash of a random string. Used in ``authenticate_local``
+# to keep the "user doesn't exist" branch as slow as a real verify.
+_DUMMY_PASSWORD_HASH = hash_password("this-is-a-fixed-dummy-string-for-timing-equalisation")
+
+
+async def _get_registration_policy(db: AsyncSession) -> str:
+    """Returns the active registration policy. Falls back to "public" when
+    the repo config row hasn't been seeded yet — the bootstrap creates it
+    immediately, but defaulting open here avoids a chicken-and-egg surprise."""
+    config = (await db.execute(select(RepoConfig).limit(1))).scalar_one_or_none()
+    if config is None:
+        return "public"
+    return config.registration_policy
+
+
+async def _issue_token_pair(
+    db: AsyncSession,
+    user: User,
+    *,
+    parent_jti: str | None = None,
+    request_meta: tuple[str | None, str | None] | None = None,
+) -> tuple[str, str]:
+    """Mint a new (access, refresh) pair and persist the refresh-token row.
+
+    ``parent_jti`` is the jti of the refresh token this pair replaces (set
+    on rotation, None on a fresh login). The DB row is the source of
+    truth: only a row whose ``used_at IS NULL`` and ``revoked_at IS NULL``
+    is still redeemable.
+
+    A login (``parent_jti is None``) also creates a ``UserSession`` row;
+    a rotation updates the existing session's ``jti`` and ``last_seen_at``
+    so the account page shows fresh activity timestamps without inflating
+    the session count.
+    """
+    from app.models.user_session import UserSession
+
+    extra = {"role": user.role.value, "username": user.username}
+    access = create_access_token(str(user.id), extra=extra)
+    refresh_jti = secrets.token_urlsafe(16)
+    refresh = create_refresh_token(str(user.id), jti=refresh_jti)
+    db.add(
+        RefreshToken(
+            jti=refresh_jti,
+            user_id=user.id,
+            parent_jti=parent_jti,
+            expires_at=datetime.now(UTC) + timedelta(days=settings.refresh_token_expire_days),
+        )
+    )
+
+    ip_hash, user_agent = request_meta or (None, None)
+    now = datetime.now(UTC)
+    if parent_jti is None:
+        # Fresh login → new session row.
+        db.add(
+            UserSession(
+                user_id=user.id,
+                jti=refresh_jti,
+                ip_hash=ip_hash,
+                user_agent=user_agent,
+                last_seen_at=now,
+            )
+        )
+    else:
+        # Rotation → advance the existing session pointer. If we can't find
+        # the row (manual revoke, schema migration, etc.) we silently create
+        # a fresh one rather than dropping the rotation.
+        session = (
+            await db.execute(
+                select(UserSession).where(UserSession.jti == parent_jti)
+            )
+        ).scalar_one_or_none()
+        if session is not None:
+            session.jti = refresh_jti
+            session.last_seen_at = now
+        else:
+            db.add(
+                UserSession(
+                    user_id=user.id,
+                    jti=refresh_jti,
+                    ip_hash=ip_hash,
+                    user_agent=user_agent,
+                    last_seen_at=now,
+                )
+            )
+
+    await db.flush()
+    return access, refresh
+
+
+async def _revoke_refresh_chain(db: AsyncSession, jti: str) -> None:
+    """Walk the parent/child chain of a refresh-token row and mark every
+    descendant + ancestor revoked. Called when re-use of a consumed token
+    is detected — that's the signal that one of the two parties has been
+    compromised, and we don't know which. Burning the whole family logs
+    out both."""
+    # Walk forward: any row whose ``parent_jti`` is in our set joins the
+    # family. Iterate until stable.
+    family: set[str] = {jti}
+    while True:
+        rows = (
+            await db.execute(
+                select(RefreshToken.jti).where(RefreshToken.parent_jti.in_(family))
+            )
+        ).scalars().all()
+        new = set(rows) - family
+        if not new:
+            break
+        family |= new
+    # Also walk backward from the initial jti.
+    cur = jti
+    while True:
+        row = (
+            await db.execute(select(RefreshToken).where(RefreshToken.jti == cur))
+        ).scalar_one_or_none()
+        if row is None or row.parent_jti is None:
+            break
+        family.add(row.parent_jti)
+        cur = row.parent_jti
+    now = datetime.now(UTC)
+    await db.execute(
+        update(RefreshToken)
+        .where(RefreshToken.jti.in_(family), RefreshToken.revoked_at.is_(None))
+        .values(revoked_at=now)
+    )
+    from app.models.user_session import UserSession
+
+    await db.execute(
+        update(UserSession)
+        .where(UserSession.jti.in_(family), UserSession.revoked_at.is_(None))
+        .values(revoked_at=now)
+    )
+
+
+async def verify_local_credentials(
+    db: AsyncSession,
+    email: str,
+    password: str,
+) -> User:
+    """Just check the password; no tokens minted yet. Used by the login
+    flow when MFA needs to gate the token issuance step."""
+    user = (
+        await db.execute(select(User).where(User.email == email))
+    ).scalar_one_or_none()
+    if user is None or user.hashed_password is None:
+        verify_password(password, _DUMMY_PASSWORD_HASH)
+        raise AuthError("Invalid credentials")
+    # Password first: "Account disabled" only for whoever knows it, so the
+    # message can't be used to probe which addresses have an account.
+    if not verify_password(password, user.hashed_password):
+        raise AuthError("Invalid credentials")
+    if not user.is_active:
+        raise AuthError("Account disabled")
+    return user
+
+
+async def issue_tokens_for_user(
+    db: AsyncSession,
+    user: User,
+    *,
+    request_meta: tuple[str | None, str | None] | None = None,
+) -> tuple[str, str]:
+    """Mint an access+refresh pair for an already-authenticated user.
+    The MFA flow uses this after the second-factor check; the regular
+    login path goes through ``authenticate_local`` (which calls this
+    indirectly via ``_issue_token_pair``)."""
+    user.last_login_at = datetime.now(UTC)
+    return await _issue_token_pair(db, user, request_meta=request_meta)
+
+
+async def authenticate_local(
+    db: AsyncSession,
+    email: str,
+    password: str,
+    *,
+    request_meta: tuple[str | None, str | None] | None = None,
+) -> tuple[User, str, str]:
+    user = (
+        await db.execute(select(User).where(User.email == email))
+    ).scalar_one_or_none()
+    if user is None or user.hashed_password is None:
+        # Burn an argon2 verify against a known-bad hash so the
+        # "user-doesn't-exist" branch takes the same wall-clock as the
+        # "user-exists-wrong-password" branch — closes the timing oracle
+        # an attacker would use to enumerate registered emails (CWE-208).
+        verify_password(password, _DUMMY_PASSWORD_HASH)
+        raise AuthError("Invalid credentials")
+    if not verify_password(password, user.hashed_password):
+        raise AuthError("Invalid credentials")
+    if not user.is_active:
+        raise AuthError("Account disabled")
+
+    user.last_login_at = datetime.now(UTC)
+    access, refresh = await _issue_token_pair(db, user, request_meta=request_meta)
+    return user, access, refresh
+
+
+async def signup_local(
+    db: AsyncSession,
+    *,
+    email: str,
+    username: str,
+    password: str,
+    full_name: str | None = None,
+    invite_code: str | None = None,
+    request_meta: tuple[str | None, str | None] | None = None,
+) -> tuple[User, str, str]:
+    # The env-level allow_signup is the master switch — if an operator pinned
+    # it off, no DB policy can override that.
+    if not settings.allow_signup:
+        raise AuthError("Signup is disabled")
+
+    policy = await _get_registration_policy(db)
+    if policy == "closed":
+        raise AuthError("Signup is disabled")
+    if policy == "invite" and not invite_code:
+        raise AuthError("An invite code is required")
+
+    existing = (
+        await db.execute(
+            select(User.id)
+            .where((func.lower(User.email) == email.lower()) | (User.username == username))
+            .limit(1)
+        )
+    ).first()
+    if existing is not None:
+        raise AuthError("Email or username already taken")
+
+    # Resolve the invite first so we don't half-create a user only to discover
+    # the code was bad. We re-attach the user.id below once SQLAlchemy assigns it.
+    invite: InviteCode | None = None
+    if policy == "invite":
+        # Explicit runtime guard (not ``assert`` — that is stripped under
+        # ``python -O``, which would turn this invite gate into a no-op).
+        if invite_code is None:
+            raise AuthError("An invite code is required")
+        invite = (
+            await db.execute(select(InviteCode).where(InviteCode.code == invite_code))
+        ).scalar_one_or_none()
+        if invite is None:
+            raise AuthError("Invalid invite code")
+        if not invite.is_usable:
+            raise AuthError("Invite code has already been used or has expired")
+
+    user = User(
+        email=email,
+        username=username,
+        full_name=full_name,
+        hashed_password=hash_password(password),
+        role=UserRole.USER,
+        auth_provider=AuthProvider.LOCAL,
+        is_active=True,
+        last_login_at=datetime.now(UTC),
+    )
+    db.add(user)
+    await db.flush()
+    if invite is not None:
+        # Conditional UPDATE so two concurrent signups racing on the same
+        # code can't both burn it: only the first one whose ``used_at IS
+        # NULL`` claim still holds gets to claim it. ``rowcount`` is 0 if
+        # someone else consumed it in the meantime.
+        now = datetime.now(UTC)
+        result = await db.execute(
+            update(InviteCode)
+            .where(InviteCode.id == invite.id, InviteCode.used_at.is_(None))
+            .values(used_at=now, used_by_user_id=user.id)
+        )
+        if result.rowcount == 0:
+            raise AuthError("Invite code has already been used or has expired")
+        await db.flush()
+    access, refresh = await _issue_token_pair(db, user, request_meta=request_meta)
+    return user, access, refresh
+
+
+async def refresh_tokens(
+    db: AsyncSession,
+    refresh_token: str,
+    *,
+    request_meta: tuple[str | None, str | None] | None = None,
+) -> tuple[User, str, str]:
+    """Exchange a refresh token for a fresh access + refresh pair.
+
+    Implements rotation + reuse detection per RFC 9700 §2.2.2:
+      * Each refresh token is single-use. The DB row tracks ``used_at``.
+      * Successful redemption marks the consumed row used and mints a
+        replacement whose ``parent_jti`` points back at it.
+      * Presenting an already-consumed (or revoked) refresh token revokes
+        every member of the chain — the legitimate user is logged out, but
+        so is whoever was holding the leaked copy.
+      * Password change (see ``users.password_changed_at``) and admin
+        disable proactively revoke every outstanding refresh row.
+    """
+    try:
+        payload = decode_token(refresh_token)
+    except Exception as exc:  # JWTError, ExpiredSignatureError, ...
+        raise AuthError("Invalid refresh token") from exc
+    if payload.get("type") != "refresh":
+        raise AuthError("Not a refresh token")
+    sub = payload.get("sub")
+    jti = payload.get("jti")
+    iat = payload.get("iat")
+    if not sub or not jti:
+        raise AuthError("Refresh token missing claims")
+    try:
+        user_id = uuid.UUID(sub)
+    except ValueError as exc:
+        raise AuthError("Invalid subject") from exc
+
+    user = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if user is None or not user.is_active:
+        raise AuthError("User not found or disabled")
+
+    # C5: token issued before the last password change is dead.
+    if user.password_changed_at is not None and iat is not None:
+        token_iat = datetime.fromtimestamp(int(iat), tz=UTC)
+        if token_iat < user.password_changed_at:
+            raise AuthError("Refresh token invalidated by a password change")
+
+    row = (
+        await db.execute(select(RefreshToken).where(RefreshToken.jti == jti))
+    ).scalar_one_or_none()
+    if row is None:
+        # Unknown jti either means forged (different secret) or already
+        # purged. Treat as invalid.
+        raise AuthError("Refresh token not recognised")
+    if row.revoked_at is not None:
+        raise AuthError("Refresh token revoked")
+    if row.used_at is not None:
+        # Re-use detected — burn the whole family. ``get_db`` would roll
+        # back the revoke if we just raised the AuthError, so we commit
+        # the family-revoke explicitly first.
+        await _revoke_refresh_chain(db, jti)
+        await db.commit()
+        raise AuthError("Refresh token re-use detected; session revoked")
+
+    # Atomic consume: only the first racing claim wins.
+    consume = await db.execute(
+        update(RefreshToken)
+        .where(RefreshToken.jti == jti, RefreshToken.used_at.is_(None))
+        .values(used_at=datetime.now(UTC))
+    )
+    if consume.rowcount == 0:
+        await _revoke_refresh_chain(db, jti)
+        await db.commit()
+        raise AuthError("Refresh token re-use detected; session revoked")
+
+    access, refresh = await _issue_token_pair(
+        db, user, parent_jti=jti, request_meta=request_meta
+    )
+    return user, access, refresh
+
+
+async def revoke_all_refresh_tokens(db: AsyncSession, user_id: uuid.UUID) -> None:
+    """Mark every outstanding refresh token of ``user_id`` revoked.
+
+    Called when the password changes (or an admin disables the account) so
+    a leaked refresh token stops working before its 30-day expiry. Also
+    revokes the matching ``UserSession`` rows so the account page reflects
+    the new state.
+    """
+    from app.models.user_session import UserSession
+
+    now = datetime.now(UTC)
+    await db.execute(
+        update(RefreshToken)
+        .where(
+            RefreshToken.user_id == user_id,
+            RefreshToken.revoked_at.is_(None),
+            RefreshToken.used_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+    await db.execute(
+        update(UserSession)
+        .where(
+            UserSession.user_id == user_id,
+            UserSession.revoked_at.is_(None),
+        )
+        .values(revoked_at=now)
+    )
+
+
+_USERNAME_STRIP = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def _oidc_username(preferred: str | None, email: str) -> str:
+    """Username for a new SSO account, shaped like local signups
+    (``[A-Za-z0-9_.-]``, 3-64 chars): IdP claims are free text."""
+    for raw in (preferred, email.split("@")[0]):
+        cleaned = _USERNAME_STRIP.sub("", raw or "")[:60]
+        if len(cleaned) >= 3:
+            return cleaned
+    return "user"
+
+
+async def _owns_or_maintains_apps(db: AsyncSession, user_id: uuid.UUID) -> bool:
+    from app.models.app import App
+    from app.models.app_collaborator import AppCollaborator
+
+    owned = (
+        await db.execute(select(App.id).where(App.owner_id == user_id).limit(1))
+    ).first()
+    if owned is not None:
+        return True
+    collab = (
+        await db.execute(
+            select(AppCollaborator.app_id).where(AppCollaborator.user_id == user_id).limit(1)
+        )
+    ).first()
+    return collab is not None
+
+
+async def _is_last_active_admin(db: AsyncSession, user: User) -> bool:
+    others = (
+        await db.execute(
+            select(func.count(User.id)).where(
+                User.id != user.id,
+                User.role == UserRole.ADMIN,
+                User.is_active.is_(True),
+            )
+        )
+    ).scalar_one()
+    return others == 0
+
+
+async def link_or_create_oidc_user(
+    db: AsyncSession,
+    *,
+    subject: str,
+    email: str,
+    username: str | None,
+    full_name: str | None,
+    is_admin: bool,
+    invite_code: str | None = None,
+) -> User:
+    """Find or create a user from an OIDC ID-token. ``subject`` is the IdP's sub claim.
+
+    Existing users (matched by sub or by email) always log in regardless of
+    the registration policy — closing signup must never lock current users
+    out of their account. The policy only gates the new-user branch:
+      * ``ALLOW_SIGNUP=false`` → reject (the env master switch, as for local signup)
+      * "closed" → reject
+      * "invite" → require a valid invite code (consumed on success)
+      * "public" → free signup
+
+    The role follows the IdP only when ``OIDC_ADMIN_CLAIM`` is configured:
+    the claim grants admin, and removing it demotes an admin the claim
+    managed — never the last active admin, and never below uploader while
+    the account still owns or maintains apps. Without a configured claim
+    the role is whatever an admin set locally.
+    """
+    user = (
+        await db.execute(select(User).where(User.oidc_subject == subject))
+    ).scalar_one_or_none()
+
+    was_oidc_managed = user is not None
+    invite: InviteCode | None = None
+    if user is None:
+        # No sub link yet — try to merge with a local account by email.
+        user = (
+            await db.execute(
+                select(User).where(func.lower(User.email) == email.lower()).limit(1)
+            )
+        ).scalars().first()
+        if user is not None:
+            if user.oidc_subject and user.oidc_subject != subject:
+                # Already bound to another identity: an e-mail match (a
+                # recycled address, a second IdP account) must not move the
+                # account over to a different one.
+                raise AuthError(
+                    "This account is linked to another SSO identity.",
+                    code="identity_conflict",
+                )
+            if not user.is_active:
+                raise AuthError("Account disabled", code="account_disabled")
+            user.oidc_subject = subject
+            user.auth_provider = AuthProvider.OIDC
+        else:
+            # Brand-new account — apply the registration policy.
+            if not settings.allow_signup:
+                raise AuthError("Signup is disabled", code="signup_disabled")
+            policy = await _get_registration_policy(db)
+            if policy == "closed":
+                raise AuthError(
+                    "Signup is closed on this repo. Ask an admin to create an account for you.",
+                    code="signup_closed",
+                )
+            if policy == "invite":
+                if not invite_code:
+                    raise AuthError(
+                        "An invite code is required to create an account via SSO.",
+                        code="invite_required",
+                    )
+                invite = (
+                    await db.execute(
+                        select(InviteCode).where(InviteCode.code == invite_code)
+                    )
+                ).scalar_one_or_none()
+                if invite is None:
+                    raise AuthError("Invalid invite code", code="invite_invalid")
+                if not invite.is_usable:
+                    raise AuthError(
+                        "Invite code has already been used or has expired", code="invite_used"
+                    )
+
+            # ensure username uniqueness; append digits if needed
+            base_username = _oidc_username(username, email)
+            attempt = base_username
+            i = 1
+            while (
+                await db.execute(select(User.id).where(User.username == attempt))
+            ).first() is not None:
+                attempt = f"{base_username}{i}"
+                i += 1
+            user = User(
+                email=email,
+                username=attempt,
+                full_name=(full_name or "").strip()[:255] or None,
+                auth_provider=AuthProvider.OIDC,
+                oidc_subject=subject,
+                role=UserRole.ADMIN if is_admin else UserRole.USER,
+                is_active=True,
+            )
+            db.add(user)
+            await db.flush()
+            if invite is not None:
+                # Conditional UPDATE, as in ``signup_local``: two SSO signups
+                # racing on one code can't both consume it.
+                result = await db.execute(
+                    update(InviteCode)
+                    .where(InviteCode.id == invite.id, InviteCode.used_at.is_(None))
+                    .values(used_at=datetime.now(UTC), used_by_user_id=user.id)
+                )
+                if result.rowcount == 0:
+                    raise AuthError(
+                        "Invite code has already been used or has expired", code="invite_used"
+                    )
+
+    if not user.is_active:
+        raise AuthError("Account disabled", code="account_disabled")
+    user.last_login_at = datetime.now(UTC)
+    if (settings.oidc_admin_claim or "").strip():
+        if is_admin and user.role != UserRole.ADMIN:
+            user.role = UserRole.ADMIN
+        elif (
+            not is_admin
+            and was_oidc_managed
+            and user.role == UserRole.ADMIN
+            and not await _is_last_active_admin(db, user)
+        ):
+            user.role = (
+                UserRole.UPLOADER
+                if await _owns_or_maintains_apps(db, user.id)
+                else UserRole.USER
+            )
+    await db.flush()
+    return user
+
+

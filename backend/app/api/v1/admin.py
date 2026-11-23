@@ -1,0 +1,1133 @@
+from __future__ import annotations
+
+import secrets
+import uuid
+from datetime import UTC, datetime, timedelta
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, Response, UploadFile, status
+from sqlalchemy import desc, func, select
+from sqlalchemy.orm import aliased, selectinload
+
+from app.api.deps import DbSession, get_current_admin
+from app.core.database import run_after_commit
+from app.core.security import hash_password
+from app.core.uploads import normalize_image, read_capped
+from app.models.api_key import ApiKey
+from app.models.apk import Apk, ApkStatus
+from app.models.app import App, AppStatus, Category
+from app.models.audit import DownloadEvent
+from app.models.audit_log import AuditLog
+from app.models.invite_code import InviteCode
+from app.models.package_signer import PackageSignerPin
+from app.models.repo_config import RepoConfig
+from app.models.user import User, UserRole
+from app.schemas.app import AppAdminUpdate, AppDetail, AppRead
+from app.schemas.audit_log import AuditLogPage, AuditLogRead
+from app.schemas.invite import InviteCodeCreate, InviteCodeRead
+from app.schemas.repo import RepoConfigRead, RepoConfigUpdate
+from app.schemas.user import AdminUserCreate, AdminUserUpdate, UserRead
+from app.services.audit import write_event
+from app.services.queue import enqueue_reindex
+from app.services.suggested_version import recompute_auto
+from app.storage import get_storage
+
+router = APIRouter()
+
+
+# --------------------------------------------------------------------------
+# Users
+# --------------------------------------------------------------------------
+@router.get("/users", response_model=list[UserRead])
+async def list_users(
+    db: DbSession,
+    _: Annotated[User, Depends(get_current_admin)],
+    q: str | None = Query(default=None, max_length=200),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> list[UserRead]:
+    stmt = select(User).order_by(User.created_at.desc())
+    if q:
+        like = f"%{q}%"
+        stmt = stmt.where((User.email.ilike(like)) | (User.username.ilike(like)))
+    rows = (await db.execute(stmt.limit(min(limit, 500)).offset(offset))).scalars().all()
+    return [UserRead.model_validate(u) for u in rows]
+
+
+@router.post("/users", response_model=UserRead, status_code=status.HTTP_201_CREATED)
+async def create_user(
+    payload: AdminUserCreate,
+    db: DbSession,
+    _: Annotated[User, Depends(get_current_admin)],
+) -> UserRead:
+    existing = (
+        await db.execute(
+            select(User.id)
+            .where(
+                (func.lower(User.email) == str(payload.email).lower())
+                | (User.username == payload.username)
+            )
+            .limit(1)
+        )
+    ).first()
+    if existing is not None:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email or username already exists")
+    user = User(
+        email=payload.email,
+        username=payload.username,
+        full_name=payload.full_name,
+        hashed_password=hash_password(payload.password),
+        role=payload.role,
+        is_active=True,
+    )
+    db.add(user)
+    await db.flush()
+    return UserRead.model_validate(user)
+
+
+async def _would_orphan_admins(db, target: User, *, removing_admin: bool, disabling: bool) -> bool:
+    """Return True if applying the change leaves zero active admins."""
+    if target.role != UserRole.ADMIN:
+        return False
+    if not (removing_admin or disabling):
+        return False
+    other_active_admins = (
+        await db.execute(
+            select(func.count(User.id)).where(
+                User.id != target.id,
+                User.role == UserRole.ADMIN,
+                User.is_active.is_(True),
+            )
+        )
+    ).scalar_one()
+    return other_active_admins == 0
+
+
+@router.patch("/users/{user_id}", response_model=UserRead)
+async def update_user(
+    user_id: uuid.UUID,
+    payload: AdminUserUpdate,
+    db: DbSession,
+    request: Request,
+    admin: Annotated[User, Depends(get_current_admin)],
+) -> UserRead:
+    target = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    before_role = target.role
+    before_active = target.is_active
+    # Refuse the change if it would leave the repo with zero active admins
+    # — there's no in-app recovery from that state (CWE-840).
+    if await _would_orphan_admins(
+        db,
+        target,
+        removing_admin=(payload.role is not None and payload.role != UserRole.ADMIN),
+        disabling=(payload.is_active is False),
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Refusing change: this would leave the repo without an active admin",
+        )
+
+    # Downgrading away from an upload-capable role (admin or uploader)
+    # to plain ``user`` is refused when the target still owns apps or
+    # has open collaborations. Otherwise the apps' /my-apps surface
+    # would become invisible to their own owner, and any collaborator
+    # row would point at a user who can no longer push to /my-apps.
+    # Admin must transfer / delete the apps OR remove the collab rows
+    # first.
+    if (
+        payload.role is not None
+        and payload.role == UserRole.USER
+        and target.role in (UserRole.ADMIN, UserRole.UPLOADER)
+    ):
+        from app.models.app import App
+        from app.models.app_collaborator import AppCollaborator
+
+        owned_count = (
+            await db.execute(
+                select(func.count()).select_from(App).where(App.owner_id == target.id)
+            )
+        ).scalar_one()
+        collab_count = (
+            await db.execute(
+                select(func.count())
+                .select_from(AppCollaborator)
+                .where(AppCollaborator.user_id == target.id)
+            )
+        ).scalar_one()
+        if owned_count or collab_count:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Cannot downgrade to user: this account still owns {owned_count} app(s) "
+                    f"and has {collab_count} collaboration(s). Transfer / delete them first."
+                ),
+            )
+
+    if payload.full_name is not None:
+        target.full_name = payload.full_name
+    if payload.role is not None:
+        target.role = payload.role
+    if payload.is_active is not None:
+        target.is_active = payload.is_active
+    # Quota overrides — set, leave alone, or reset to NULL.
+    if payload.quota_reset_apps:
+        target.quota_max_apps = None
+    elif payload.quota_max_apps is not None:
+        target.quota_max_apps = payload.quota_max_apps
+    if payload.quota_reset_storage_bytes:
+        target.quota_max_storage_bytes = None
+    elif payload.quota_max_storage_bytes is not None:
+        target.quota_max_storage_bytes = payload.quota_max_storage_bytes
+    if payload.quota_reset_apks_per_month:
+        target.quota_max_apks_per_month = None
+    elif payload.quota_max_apks_per_month is not None:
+        target.quota_max_apks_per_month = payload.quota_max_apks_per_month
+    if payload.new_password:
+        target.hashed_password = hash_password(payload.new_password)
+        # Bump password_changed_at so every outstanding access / refresh
+        # token for this user is immediately invalidated by the JWT
+        # decoder (C5) + revoke their persisted refresh-token rows (C6).
+        target.password_changed_at = datetime.now(UTC)
+        from app.services.auth_service import revoke_all_refresh_tokens
+
+        await revoke_all_refresh_tokens(db, target.id)
+    # If an admin disables a user, kill their sessions too — otherwise the
+    # JWT they're holding keeps working until expiry.
+    if payload.is_active is False:
+        from app.services.auth_service import revoke_all_refresh_tokens
+
+        await revoke_all_refresh_tokens(db, target.id)
+        target.password_changed_at = datetime.now(UTC)
+    diff: dict[str, object] = {}
+    if payload.role is not None and payload.role != before_role:
+        diff["role"] = {"from": before_role.value, "to": payload.role.value}
+    if payload.is_active is not None and payload.is_active != before_active:
+        diff["is_active"] = {"from": before_active, "to": payload.is_active}
+    if payload.new_password:
+        diff["password_reset"] = True
+    if diff:
+        await write_event(
+            db,
+            action="user.updated",
+            actor=admin,
+            target_type="user",
+            target_id=target.id,
+            summary=f"updated {target.username}",
+            payload=diff,
+            request=request,
+        )
+    await db.flush()
+    return UserRead.model_validate(target)
+
+
+@router.delete("/users/{user_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None, response_class=Response)
+async def delete_user(
+    user_id: uuid.UUID,
+    db: DbSession,
+    request: Request,
+    admin: Annotated[User, Depends(get_current_admin)],
+) -> None:
+    if user_id == admin.id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Cannot delete yourself")
+    target = (await db.execute(select(User).where(User.id == user_id))).scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    if await _would_orphan_admins(db, target, removing_admin=True, disabling=True):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Refusing delete: this would leave the repo without an active admin",
+        )
+    await write_event(
+        db,
+        action="user.deleted",
+        actor=admin,
+        target_type="user",
+        target_id=target.id,
+        summary=f"deleted {target.username}",
+        payload={"username": target.username, "email": target.email},
+        request=request,
+    )
+    await db.delete(target)
+    await db.flush()
+
+
+# --------------------------------------------------------------------------
+# Apps moderation
+# --------------------------------------------------------------------------
+@router.get("/apps", response_model=list[AppDetail])
+async def admin_list_apps(
+    db: DbSession,
+    user: Annotated[User, Depends(get_current_admin)],
+    status_filter: str | None = Query(default=None, max_length=32),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> list[AppDetail]:
+    """Admin catalogue listing. Returns ``AppDetail`` (rather than the
+    public ``AppRead``) so the moderation UI sees the embedded ``apks``
+    list — that's what powers the "pending review" queue and the
+    per-version Publish / Reject controls without a second roundtrip."""
+    stmt = (
+        select(App)
+        .options(
+            selectinload(App.categories),
+            selectinload(App.apks),
+            selectinload(App.screenshots),
+            selectinload(App.localizations),
+            selectinload(App.owner),
+        )
+        .order_by(App.created_at.desc())
+    )
+    if status_filter:
+        stmt = stmt.where(App.status == status_filter)
+    rows = (await db.execute(stmt.limit(min(limit, 500)).offset(offset))).scalars().unique().all()
+    from app.api.v1.apps import _attach_media_token
+    out: list[AppDetail] = []
+    for a in rows:
+        detail = AppDetail.model_validate(a)
+        if a.owner is not None:
+            detail.owner_id = a.owner.id
+            detail.owner_username = a.owner.username
+        _attach_media_token(detail, a, user)
+        out.append(detail)
+    return out
+
+
+@router.patch("/apps/{app_id}", response_model=AppRead)
+async def admin_update_app(
+    app_id: uuid.UUID,
+    payload: AppAdminUpdate,
+    db: DbSession,
+    request: Request,
+    admin: Annotated[User, Depends(get_current_admin)],
+) -> AppRead:
+    app = (
+        await db.execute(
+            select(App)
+            .options(selectinload(App.categories), selectinload(App.apks))
+            .where(App.id == app_id)
+        )
+    ).scalar_one_or_none()
+    if app is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="App not found")
+    before_visibility = app.visibility.value
+    before_status = app.status.value
+
+    # Apply user-facing fields
+    for f in (
+        "name", "summary", "description", "license",
+        "author_name", "author_email",
+        "donate", "liberapay", "bitcoin", "open_collective", "translation",
+    ):
+        v = getattr(payload, f)
+        if v is not None:
+            setattr(app, f, v)
+    if payload.visibility is not None:
+        app.visibility = payload.visibility
+    if payload.website is not None:
+        app.website = str(payload.website)
+    if payload.source_code is not None:
+        app.source_code = str(payload.source_code)
+    if payload.issue_tracker is not None:
+        app.issue_tracker = str(payload.issue_tracker)
+    if payload.status is not None:
+        app.status = payload.status
+        if payload.status == AppStatus.PUBLISHED:
+            app.last_published_at = datetime.now(UTC)
+            if app.first_published_at is None:
+                app.first_published_at = app.last_published_at
+    # Retention override — admin-only. Reset flag wins over the value.
+    # ``0`` means "no cap for this app" (sentinel pulled by
+    # effective_max_versions) so we accept it as a real write target.
+    if payload.reset_max_versions_override:
+        app.max_versions_override = None
+    elif payload.max_versions_override is not None:
+        app.max_versions_override = payload.max_versions_override
+    if payload.category_ids is not None:
+        cats = list(
+            (
+                await db.execute(select(Category).where(Category.id.in_(payload.category_ids)))
+            ).scalars().all()
+        )
+        app.categories = cats
+    diff: dict[str, object] = {}
+    if payload.visibility is not None and payload.visibility.value != before_visibility:
+        diff["visibility"] = {"from": before_visibility, "to": payload.visibility.value}
+    if payload.status is not None and payload.status.value != before_status:
+        diff["status"] = {"from": before_status, "to": payload.status.value}
+    if diff:
+        await write_event(
+            db,
+            action="app.updated",
+            actor=admin,
+            target_type="app",
+            target_id=app.id,
+            summary=f"updated {app.package_name}",
+            payload=diff,
+            request=request,
+        )
+    await db.flush()
+    await enqueue_reindex()
+    from app.api.v1.apps import _attach_media_token
+    payload = AppRead.model_validate(app)
+    _attach_media_token(payload, app, admin)
+    return payload
+
+
+# --------------------------------------------------------------------------
+# APK moderation
+# --------------------------------------------------------------------------
+@router.post("/apks/{apk_id}/publish", response_model=dict)
+async def admin_publish_apk(
+    apk_id: uuid.UUID,
+    db: DbSession,
+    _: Annotated[User, Depends(get_current_admin)],
+) -> dict:
+    apk = (
+        await db.execute(
+            select(Apk)
+            .options(selectinload(Apk.app).selectinload(App.apks))
+            .where(Apk.id == apk_id)
+        )
+    ).scalar_one_or_none()
+    if apk is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="APK not found")
+    pin = (
+        await db.execute(
+            select(PackageSignerPin).where(PackageSignerPin.package_name == apk.app.package_name)
+        )
+    ).scalar_one_or_none()
+    # The signer lock is checked at upload, but two versions can sit in
+    # review before the first publish locks it: re-check here so a second
+    # signing key can't ship.
+    locked = apk.app.locked_signer_sha256 or (pin.signer_sha256 if pin else None)
+    if locked is not None and apk.signer_sha256 != locked:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This APK is signed with a different key than the published versions",
+        )
+    apk.status = ApkStatus.PUBLISHED
+    apk.published_at = datetime.now(UTC)
+    apk.app.status = AppStatus.PUBLISHED
+    if apk.app.locked_signer_sha256 is None:
+        apk.app.locked_signer_sha256 = apk.signer_sha256
+    # Lock the signer in the cross-App pin table too (C1).
+    if pin is None:
+        db.add(
+            PackageSignerPin(
+                package_name=apk.app.package_name,
+                signer_sha256=apk.signer_sha256,
+                locked_by_app_id=apk.app.id,
+                first_locked_at=datetime.now(UTC),
+            )
+        )
+    # Auto mode only, and a beta upload never becomes the suggestion.
+    recompute_auto(apk.app)
+    now = datetime.now(UTC)
+    apk.app.last_published_at = now
+    if apk.app.first_published_at is None:
+        apk.app.first_published_at = now
+    await db.flush()
+    await enqueue_reindex()
+    # Uploads that went through review were skipped by the SBOM/CVE scan
+    # while pending; scan them now that they ship.
+    from app.services.queue import enqueue_cve_scan
+
+    await enqueue_cve_scan(apk.id)
+    return {"status": "published"}
+
+
+@router.post("/apks/{apk_id}/reject", response_model=dict)
+async def admin_reject_apk(
+    apk_id: uuid.UUID,
+    db: DbSession,
+    _: Annotated[User, Depends(get_current_admin)],
+    reason: str = Query(default="Rejected by administrator", max_length=512),
+) -> dict:
+    apk = (
+        await db.execute(
+            select(Apk)
+            .options(selectinload(Apk.app).selectinload(App.apks))
+            .where(Apk.id == apk_id)
+        )
+    ).scalar_one_or_none()
+    if apk is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="APK not found")
+    was_published = apk.status == ApkStatus.PUBLISHED
+    apk.status = ApkStatus.REJECTED
+    apk.rejection_reason = reason
+    _release_suggestion(apk)
+    await db.flush()
+    if was_published:
+        # Taking a published version down must reach the index.
+        await enqueue_reindex()
+    return {"status": "rejected"}
+
+
+def _release_suggestion(apk: Apk) -> None:
+    """``apk`` stops being published: a manual pin on it would point the
+    index at a version nobody can install — fall back to auto-tracking."""
+    app = apk.app
+    if app.suggested_version_is_manual and app.suggested_version_code == apk.version_code:
+        app.suggested_version_is_manual = False
+    recompute_auto(app, [a for a in app.apks if a is not apk])
+
+
+@router.delete("/apks/{apk_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None, response_class=Response)
+async def admin_delete_apk(
+    apk_id: uuid.UUID,
+    db: DbSession,
+    request: Request,
+    admin: Annotated[User, Depends(get_current_admin)],
+) -> None:
+    apk = (
+        await db.execute(
+            select(Apk)
+            .options(selectinload(Apk.app).selectinload(App.apks))
+            .where(Apk.id == apk_id)
+        )
+    ).scalar_one_or_none()
+    if apk is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="APK not found")
+    package_name = apk.app.package_name
+    await write_event(
+        db,
+        action="apk.deleted",
+        actor=admin,
+        target_type="apk",
+        target_id=apk.id,
+        summary=f"deleted {package_name} v{apk.version_name} ({apk.version_code})",
+        payload={
+            "package_name": package_name,
+            "version_code": apk.version_code,
+        },
+        request=request,
+    )
+    _release_suggestion(apk)
+    storage_key = apk.storage_key
+    await db.delete(apk)
+    await db.flush()
+
+    async def _delete_file() -> None:
+        try:
+            await get_storage().delete(storage_key)
+        except Exception:  # noqa: BLE001 — the row is gone; an orphan file is harmless
+            pass
+
+    # The file goes only once the row deletion is committed: a failure
+    # before that must not leave a published row pointing at nothing.
+    run_after_commit(f"delete-apk:{apk_id}", _delete_file)
+    await enqueue_reindex()
+
+
+# --------------------------------------------------------------------------
+# Repo config + reindex
+# --------------------------------------------------------------------------
+def _serialize_repo_config(config: RepoConfig) -> RepoConfigRead:
+    """Build a RepoConfigRead off the ORM row + the static
+    ``*_available`` flags (which come from the env, not the DB)."""
+    from app.core.config import settings as _settings
+
+    data = RepoConfigRead.model_validate(config).model_dump()
+    data["clamav_available"] = _settings.clamav_available
+    data["trivy_available"] = _settings.trivy_available
+    return RepoConfigRead(**data)
+
+
+@router.get("/repo", response_model=RepoConfigRead)
+async def get_repo_config(
+    db: DbSession,
+    _: Annotated[User, Depends(get_current_admin)],
+) -> RepoConfigRead:
+    config = (await db.execute(select(RepoConfig).limit(1))).scalar_one()
+    return _serialize_repo_config(config)
+
+
+@router.patch("/repo", response_model=RepoConfigRead)
+async def update_repo_config(
+    payload: RepoConfigUpdate,
+    db: DbSession,
+    request: Request,
+    admin: Annotated[User, Depends(get_current_admin)],
+) -> RepoConfigRead:
+    import json as _json
+    config = (await db.execute(select(RepoConfig).limit(1))).scalar_one()
+    repo_index_dirty = False
+    if payload.name is not None:
+        config.name = payload.name
+        repo_index_dirty = True
+    if payload.description is not None:
+        config.description = payload.description
+        repo_index_dirty = True
+    if payload.address is not None:
+        config.address = str(payload.address).rstrip("/")
+        repo_index_dirty = True
+    if payload.mirrors is not None:
+        config.mirrors_json = _json.dumps([str(m) for m in payload.mirrors])
+        repo_index_dirty = True
+    if payload.public_mode is not None:
+        config.public_mode = payload.public_mode
+    if payload.registration_policy is not None:
+        config.registration_policy = payload.registration_policy
+    if payload.upload_max_apk_mb is not None:
+        config.upload_max_apk_mb = payload.upload_max_apk_mb
+    # Quota defaults — same set/leave/reset triad as the per-user knobs.
+    if payload.quota_reset_apps:
+        config.default_quota_max_apps = None
+    elif payload.default_quota_max_apps is not None:
+        config.default_quota_max_apps = payload.default_quota_max_apps
+    if payload.quota_reset_storage_bytes:
+        config.default_quota_max_storage_bytes = None
+    elif payload.default_quota_max_storage_bytes is not None:
+        config.default_quota_max_storage_bytes = payload.default_quota_max_storage_bytes
+    if payload.quota_reset_apks_per_month:
+        config.default_quota_max_apks_per_month = None
+    elif payload.default_quota_max_apks_per_month is not None:
+        config.default_quota_max_apks_per_month = payload.default_quota_max_apks_per_month
+    # Retention cap — same set/leave/reset semantics. ``0`` is a
+    # legitimate "unlimited" sentinel from the eviction service, so
+    # ``ge=0`` accepts it; the reset flag still wins.
+    if payload.quota_reset_max_versions_per_app:
+        config.default_max_versions_per_app = None
+    elif payload.default_max_versions_per_app is not None:
+        config.default_max_versions_per_app = payload.default_max_versions_per_app
+    # ClamAV toggles — reject when the env knob isn't set, so admins don't
+    # accidentally enable a scanner with nowhere to dial.
+    if payload.clamav_scan_on_upload is not None or payload.clamav_scan_periodic is not None:
+        from app.core.config import settings as _settings
+
+        if not _settings.clamav_available:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="ClamAV is not configured (set FDROID_CLAMAV_HOST to enable)",
+            )
+        if payload.clamav_scan_on_upload is not None:
+            config.clamav_scan_on_upload = payload.clamav_scan_on_upload
+        if payload.clamav_scan_periodic is not None:
+            config.clamav_scan_periodic = payload.clamav_scan_periodic
+    if payload.require_admin_2fa is not None:
+        config.require_admin_2fa = payload.require_admin_2fa
+    if payload.public_stats is not None:
+        config.public_stats = payload.public_stats
+    if payload.webauthn_required_admin is not None:
+        config.webauthn_required_admin = payload.webauthn_required_admin
+    if payload.webauthn_required_uploader is not None:
+        config.webauthn_required_uploader = payload.webauthn_required_uploader
+    if payload.cve_scanning_enabled is not None:
+        # Same pattern as the ClamAV gate above: refuse to flip the
+        # toggle on when the env knob (``TRIVY_SERVER_URL``) isn't set,
+        # so admins don't accidentally enable a feature with nowhere to
+        # dial. Flipping it OFF is always allowed.
+        if payload.cve_scanning_enabled:
+            from app.core.config import settings as _settings
+
+            if not _settings.trivy_available:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        "Trivy is not configured (start the trivy compose "
+                        "profile + set TRIVY_SERVER_URL to enable)"
+                    ),
+                )
+        config.cve_scanning_enabled = payload.cve_scanning_enabled
+    if payload.reproducible_builds_enabled is not None:
+        # No env dependency — pure on/off knob. When flipped off the
+        # frontend hides the badge + per-APK editor and the
+        # /reproducibility endpoints return 403. Historical data on
+        # ``apks.reproducibility_*`` columns is preserved so re-enabling
+        # later restores the previous state. Audited via the same
+        # ``repo.config_updated`` event written below.
+        config.reproducible_builds_enabled = payload.reproducible_builds_enabled
+    await write_event(
+        db,
+        action="repo.config_updated",
+        actor=admin,
+        target_type="repo_config",
+        target_id=config.id,
+        summary="repo config updated",
+        # ``mode="json"`` coerces Pydantic types like HttpUrl into plain
+        # strings — asyncpg's JSONB codec rejects bare Pydantic objects
+        # with ``TypeError: Object of type HttpUrl is not JSON serializable``.
+        payload=payload.model_dump(mode="json", exclude_none=True),
+        request=request,
+    )
+    await db.flush()
+    # Only re-render the index when something baked into the JSON actually
+    # changed — toggling registration policy doesn't move any bytes.
+    if repo_index_dirty:
+        await enqueue_reindex()
+    return _serialize_repo_config(config)
+
+
+@router.post("/repo/reindex", response_model=dict)
+async def trigger_reindex(
+    _: Annotated[User, Depends(get_current_admin)],
+) -> dict:
+    # Manual press — bypass the job-id dedup so the worker actually runs
+    # even when a recent rebuild's result is still in redis. Background
+    # enqueues elsewhere (upload, edit, …) keep the coalescing default.
+    await enqueue_reindex(force=True)
+    return {"queued": True}
+
+
+@router.get("/repo/additional-repos.json")
+async def additional_repos_json(
+    db: DbSession,
+    _: Annotated[User, Depends(get_current_admin)],
+) -> Response:
+    """Pre-install snippet for ROM / device-fleet builders.
+
+    F-Droid 2.0 only reads JSON (the old ``additional_repos.xml`` is gone)
+    from ``/{system_ext,product,vendor}/etc/fdroid/additional_repos.json``.
+    ``certificate`` is the hex-encoded DER certificate the client pins the
+    repo to. The format has no credentials field: on a private-mode repo
+    every device still needs an API key afterwards.
+    """
+    import json as _json
+    from pathlib import Path
+
+    from app.core.config import settings as _settings
+    from app.fdroid.keystore import KeystoreError, read_certificate_hex
+
+    config = (await db.execute(select(RepoConfig).limit(1))).scalar_one()
+    try:
+        certificate = await read_certificate_hex(
+            Path(_settings.keystore_path), _settings.keystore_password
+        )
+    except KeystoreError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Repository keystore unavailable: {exc}",
+        ) from exc
+    entry = {
+        "name": config.name,
+        "address": config.address,
+        "mirrors": config.mirrors,
+        "description": config.description or "",
+        "certificate": certificate,
+        "enabled": True,
+    }
+    return Response(
+        content=_json.dumps([entry], ensure_ascii=False, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": 'attachment; filename="additional_repos.json"'},
+    )
+
+
+@router.get("/jobs", response_model=dict)
+async def admin_jobs(
+    _: Annotated[User, Depends(get_current_admin)],
+) -> dict:
+    """Snapshot of the arq queue: queued count, in-progress count, and the
+    last ~10 completed jobs with their duration + status. Best-effort: an
+    unreachable redis returns ``available=False`` instead of raising."""
+    from app.services.queue import queue_snapshot
+
+    return await queue_snapshot()
+
+
+@router.get("/clamav/ping", response_model=dict)
+async def admin_clamav_ping(
+    _: Annotated[User, Depends(get_current_admin)],
+) -> dict:
+    """Send ``PING`` to clamd. Returns ``{ok: bool, configured: bool}``
+    so the admin UI can render a status pill next to the toggle."""
+    from app.core.config import settings as _settings
+    from app.services.clamav import ping
+
+    if not _settings.clamav_available:
+        return {"ok": False, "configured": False}
+    return {"ok": await ping(), "configured": True}
+
+
+@router.post("/clamav/scan-now", response_model=dict)
+async def admin_clamav_scan_now(
+    db: DbSession,
+    request: Request,
+    admin: Annotated[User, Depends(get_current_admin)],
+) -> dict:
+    """Trigger a one-shot rescan of every PUBLISHED apk. Same code path
+    as the daily cron but with ``force=True`` so the periodic toggle and
+    the 24h "already scanned" cutoff are both bypassed. Coalesced under
+    a fixed job_id at the queue level — spamming the button is safe."""
+    from app.core.config import settings as _settings
+    from app.services.queue import enqueue_clamav_scan
+
+    if not _settings.clamav_available:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="ClamAV is not configured (set CLAMAV_HOST to enable)",
+        )
+    ok = await enqueue_clamav_scan()
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not reach the job queue",
+        )
+    await write_event(
+        db,
+        action="clamav.scan_triggered",
+        actor=admin,
+        target_type="repo_config",
+        summary="manual ClamAV rescan triggered",
+        request=request,
+    )
+    return {"queued": True}
+
+
+@router.get("/scans", response_model=list[dict])
+async def admin_recent_scans(
+    db: DbSession,
+    _: Annotated[User, Depends(get_current_admin)],
+    limit: int = Query(default=50, ge=1, le=200),
+    only_infected: bool = Query(default=False),
+) -> list[dict]:
+    """Most recent ApkScan rows, newest first. Each row is joined with
+    the underlying Apk + App so the admin UI can show "Nextcloud v3.30.0
+    (330010090)" instead of the bare scanner name + UUID."""
+    from app.models.apk_scan import ApkScan, ApkScanStatus
+
+    stmt = (
+        select(ApkScan, Apk, App)
+        .join(Apk, Apk.id == ApkScan.apk_id, isouter=True)
+        .join(App, App.id == Apk.app_id, isouter=True)
+        .order_by(desc(ApkScan.created_at))
+        .limit(limit)
+    )
+    if only_infected:
+        stmt = stmt.where(ApkScan.status == ApkScanStatus.INFECTED)
+    rows = (await db.execute(stmt)).all()
+    return [
+        {
+            "id": str(scan.id),
+            "apk_id": str(scan.apk_id),
+            "scanner": scan.scanner,
+            "status": scan.status.value,
+            "signatures": scan.signatures,
+            "error": scan.error,
+            "scanned_at": scan.scanned_at.isoformat() if scan.scanned_at else None,
+            "created_at": scan.created_at.isoformat(),
+            # ``app`` / ``apk`` may be NULL when the row outlives its
+            # target (cascade-deleted apk). The UI falls back to the
+            # bare apk_id in that case.
+            "app_id": str(app.id) if app else None,
+            "app_name": app.name if app else None,
+            "package_name": app.package_name if app else None,
+            "version_name": apk.version_name if apk else None,
+            "version_code": apk.version_code if apk else None,
+        }
+        for scan, apk, app in rows
+    ]
+
+
+@router.post("/apks/rescan", response_model=dict)
+async def rescan_all_apks(
+    db: DbSession,
+    _: Annotated[User, Depends(get_current_admin)],
+) -> dict:
+    """Re-parse every stored APK and refresh extracted metadata + icons.
+
+    Useful after a parser bugfix. For each app, the icon is also
+    re-extracted from the latest published APK — unless the app already
+    has a custom icon, which is preserved.
+    """
+    from app.services.rescan_service import rescan_all_apps
+
+    result = await rescan_all_apps(db)
+    await enqueue_reindex()
+    return {
+        "rescanned_apks": result.rescanned_apks,
+        "icons_refreshed": result.icons_refreshed,
+        "failed": result.failed,
+    }
+
+
+@router.post("/apps/{app_id}/rescan", response_model=dict)
+async def rescan_one_app(
+    app_id: uuid.UUID,
+    db: DbSession,
+    _: Annotated[User, Depends(get_current_admin)],
+) -> dict:
+    """Rescan one app's APKs and refresh its icon. Same semantics as the
+    global rescan but limited to a single app — used by the admin UI's
+    per-row button."""
+    from app.services.rescan_service import rescan_app
+
+    target = (
+        await db.execute(
+            select(App).options(selectinload(App.apks)).where(App.id == app_id)
+        )
+    ).scalar_one_or_none()
+    if target is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="App not found")
+
+    result = await rescan_app(db, target)
+    await enqueue_reindex()
+    return {
+        "rescanned_apks": result.rescanned_apks,
+        "icons_refreshed": result.icons_refreshed,
+        "failed": result.failed,
+    }
+
+
+@router.post("/repo/icon", response_model=RepoConfigRead)
+async def upload_repo_icon(
+    db: DbSession,
+    _: Annotated[User, Depends(get_current_admin)],
+    file: UploadFile = File(...),
+) -> RepoConfigRead:
+    """Upload a custom repo icon. PNG output, max 512×512."""
+    raw = await read_capped(file, 4 * 1024 * 1024)
+    if not raw:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Empty file")
+    png = await normalize_image(raw, (512, 512))
+
+    storage = get_storage()
+    ts = int(datetime.now(UTC).timestamp())
+    key = f"icons/repo-icon-{ts}.png"
+    await storage.put(key, png, content_type="image/png")
+
+    config = (await db.execute(select(RepoConfig).limit(1))).scalar_one()
+    config.icon_path = key
+    await db.flush()
+    await enqueue_reindex()
+    return _serialize_repo_config(config)
+
+
+# --------------------------------------------------------------------------
+# Stats
+# --------------------------------------------------------------------------
+@router.get("/stats", response_model=dict)
+async def admin_stats(
+    db: DbSession,
+    _: Annotated[User, Depends(get_current_admin)],
+) -> dict:
+    total_users = (await db.execute(select(func.count(User.id)))).scalar_one()
+    total_apps = (await db.execute(select(func.count(App.id)))).scalar_one()
+    published_apps = (
+        await db.execute(select(func.count(App.id)).where(App.status == AppStatus.PUBLISHED))
+    ).scalar_one()
+    pending_apks = (
+        await db.execute(select(func.count(Apk.id)).where(Apk.status == ApkStatus.PENDING_REVIEW))
+    ).scalar_one()
+    total_downloads = (
+        await db.execute(select(func.count(DownloadEvent.id)))
+    ).scalar_one()
+    total_api_keys = (await db.execute(select(func.count(ApiKey.id)))).scalar_one()
+
+    # Join with App + User so the admin UI can render names instead of UUIDs.
+    # Both joins are left-outer because anon downloads and deleted apps/users
+    # still belong in the history.
+    recent_downloads = (
+        await db.execute(
+            select(DownloadEvent, App.name, User.username)
+            .join(App, DownloadEvent.app_id == App.id, isouter=True)
+            .join(User, DownloadEvent.user_id == User.id, isouter=True)
+            .order_by(desc(DownloadEvent.created_at))
+            .limit(20)
+        )
+    ).all()
+
+    return {
+        "total_users": total_users,
+        "total_apps": total_apps,
+        "published_apps": published_apps,
+        "pending_apks": pending_apks,
+        "total_downloads": total_downloads,
+        "total_api_keys": total_api_keys,
+        "recent_downloads": [
+            {
+                "id": str(ev.id),
+                "apk_id": str(ev.apk_id),
+                "app_id": str(ev.app_id),
+                "app_name": app_name,
+                "user_id": str(ev.user_id) if ev.user_id else None,
+                "username": username,
+                "created_at": ev.created_at.isoformat(),
+            }
+            for ev, app_name, username in recent_downloads
+        ],
+    }
+
+
+# --------------------------------------------------------------------------
+# Invite codes (used when registration_policy = "invite")
+# --------------------------------------------------------------------------
+def _generate_invite_code() -> str:
+    # 16 chars from token_urlsafe -> ~96 bits of entropy. Plenty for a
+    # human-shareable single-use code, still short enough to read aloud.
+    return secrets.token_urlsafe(12)[:16]
+
+
+async def _serialize_invite(db, invite: InviteCode) -> InviteCodeRead:
+    """Hydrate with the creator/consumer usernames so the admin UI doesn't
+    need a per-row /users round-trip."""
+    creator_name: str | None = None
+    consumer_name: str | None = None
+    if invite.created_by_user_id is not None:
+        creator_name = (
+            await db.execute(
+                select(User.username).where(User.id == invite.created_by_user_id)
+            )
+        ).scalar_one_or_none()
+    if invite.used_by_user_id is not None:
+        consumer_name = (
+            await db.execute(
+                select(User.username).where(User.id == invite.used_by_user_id)
+            )
+        ).scalar_one_or_none()
+    return InviteCodeRead(
+        id=invite.id,
+        code=invite.code,
+        note=invite.note,
+        created_at=invite.created_at,
+        expires_at=invite.expires_at,
+        used_at=invite.used_at,
+        created_by_username=creator_name,
+        used_by_username=consumer_name,
+    )
+
+
+@router.get("/invites", response_model=list[InviteCodeRead])
+async def list_invite_codes(
+    db: DbSession,
+    _: Annotated[User, Depends(get_current_admin)],
+) -> list[InviteCodeRead]:
+    """Newest first. Includes both pending and consumed codes — the admin
+    can see audit history at a glance."""
+    creator = aliased(User)
+    consumer = aliased(User)
+    rows = (
+        await db.execute(
+            select(InviteCode, creator.username, consumer.username)
+            .join(creator, InviteCode.created_by_user_id == creator.id, isouter=True)
+            .join(consumer, InviteCode.used_by_user_id == consumer.id, isouter=True)
+            .order_by(desc(InviteCode.created_at))
+        )
+    ).all()
+    return [
+        InviteCodeRead(
+            id=inv.id,
+            code=inv.code,
+            note=inv.note,
+            created_at=inv.created_at,
+            expires_at=inv.expires_at,
+            used_at=inv.used_at,
+            created_by_username=cname,
+            used_by_username=uname,
+        )
+        for inv, cname, uname in rows
+    ]
+
+
+@router.post("/invites", response_model=InviteCodeRead, status_code=status.HTTP_201_CREATED)
+async def create_invite_code(
+    payload: InviteCodeCreate,
+    db: DbSession,
+    admin: Annotated[User, Depends(get_current_admin)],
+) -> InviteCodeRead:
+    # Collisions are statistically impossible at 96 bits, but treating the
+    # unique constraint as authoritative beats hand-rolling a "retry on
+    # IntegrityError" loop in 99.9999% no-op territory.
+    invite = InviteCode(
+        code=_generate_invite_code(),
+        note=payload.note,
+        created_by_user_id=admin.id,
+        expires_at=(
+            datetime.now(UTC) + timedelta(days=payload.expires_in_days)
+            if payload.expires_in_days
+            else None
+        ),
+    )
+    db.add(invite)
+    await db.flush()
+    return await _serialize_invite(db, invite)
+
+
+@router.delete("/invites/{invite_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None, response_class=Response)
+async def revoke_invite_code(
+    invite_id: uuid.UUID,
+    db: DbSession,
+    _: Annotated[User, Depends(get_current_admin)],
+) -> None:
+    invite = (
+        await db.execute(select(InviteCode).where(InviteCode.id == invite_id))
+    ).scalar_one_or_none()
+    if invite is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Invite not found")
+    await db.delete(invite)
+    await db.flush()
+
+
+# --------------------------------------------------------------------------
+# Audit log
+# --------------------------------------------------------------------------
+@router.get("/audit", response_model=AuditLogPage)
+async def list_audit_log(
+    db: DbSession,
+    _: Annotated[User, Depends(get_current_admin)],
+    action: str | None = Query(default=None, max_length=64),
+    target_type: str | None = Query(default=None, max_length=32),
+    actor_id: uuid.UUID | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> AuditLogPage:
+    """Paginated reverse-chronological view of audit events.
+
+    Filters compose: e.g. ``?action=user.deleted&actor_id=<uuid>`` returns
+    only deletes performed by a specific admin. ``action`` matches by
+    prefix (``app.`` returns every app-scoped event).
+    """
+    base = select(AuditLog)
+    count_base = select(func.count(AuditLog.id))
+    if action:
+        # Prefix filter — ``app.`` matches every app event. SQLAlchemy
+        # ``startswith`` translates to LIKE 'value%' with the literal
+        # escaped for safety.
+        base = base.where(AuditLog.action.startswith(action))
+        count_base = count_base.where(AuditLog.action.startswith(action))
+    if target_type:
+        base = base.where(AuditLog.target_type == target_type)
+        count_base = count_base.where(AuditLog.target_type == target_type)
+    if actor_id:
+        base = base.where(AuditLog.actor_id == actor_id)
+        count_base = count_base.where(AuditLog.actor_id == actor_id)
+
+    total = (await db.execute(count_base)).scalar_one()
+    rows = (
+        await db.execute(
+            base.order_by(desc(AuditLog.created_at)).limit(limit).offset(offset)
+        )
+    ).scalars().all()
+
+    # Best-effort join to the user table so the response carries
+    # human-readable usernames without forcing the UI to do an N+1.
+    actor_ids = [r.actor_id for r in rows if r.actor_id is not None]
+    actors: dict[uuid.UUID, User] = {}
+    if actor_ids:
+        actor_rows = (
+            await db.execute(select(User).where(User.id.in_(actor_ids)))
+        ).scalars().all()
+        actors = {u.id: u for u in actor_rows}
+
+    items: list[AuditLogRead] = []
+    for r in rows:
+        actor = actors.get(r.actor_id) if r.actor_id else None
+        items.append(
+            AuditLogRead(
+                id=r.id,
+                created_at=r.created_at,
+                actor_id=r.actor_id,
+                actor_username=actor.username if actor else None,
+                actor_email=actor.email if actor else None,
+                action=r.action,
+                target_type=r.target_type,
+                target_id=r.target_id,
+                summary=r.summary,
+                payload=r.payload,
+                ip_hash=r.ip_hash,
+                user_agent=r.user_agent,
+            )
+        )
+    return AuditLogPage(items=items, total=total)

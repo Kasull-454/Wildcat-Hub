@@ -1,0 +1,38 @@
+# syntax=docker/dockerfile:1.6
+# ============================================================================
+# Worker image — the API image plus what the arq tasks need on top:
+#   * trivy           — optional SBOM / CVE scan of uploaded bundles
+#   * postgresql-client-16 — pg_dump / psql for the admin backup feature
+# flatpak / ostree / gnupg (repo publishing) are already in the API image.
+# ============================================================================
+ARG API_IMAGE=wildcat-hub-backend:latest
+ARG TRIVY_IMAGE=docker.io/aquasec/trivy:0.70.0
+
+FROM ${TRIVY_IMAGE} AS trivy
+
+FROM ${API_IMAGE} AS runtime
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt trixie-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        postgresql-client-16 \
+    && apt-get purge -y --auto-remove curl \
+    && rm -rf /var/lib/apt/lists/* /var/cache/apt/* /usr/share/doc /usr/share/man
+
+COPY --from=trivy /usr/local/bin/trivy /usr/local/bin/trivy
+
+RUN mkdir -p /data/backup-tmp /data/builder && \
+    chown -R fdroid:fdroid /data
+
+# Re-copy the code: a stale cached API image must not ship old tasks.
+COPY app /app/app
+RUN /opt/venv/bin/python -m compileall -q /app/app || true
+
+USER fdroid:fdroid
+CMD ["python", "-m", "arq", "app.workers.tasks.WorkerSettings"]

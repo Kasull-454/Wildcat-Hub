@@ -1,0 +1,299 @@
+name: wildcat-hub
+# Wildcat Hub — repository Flatpak self-hosted.
+#
+# Percorsi (impostali nel .env):
+#   WILDCAT_STORAGE  repo OSTree + bundle .flatpak + media     (disco grande)
+#   WILDCAT_DATA     postgres, redis, chiave GPG, cache builder (disco locale)
+#
+# Prima del primo avvio:
+#   mkdir -p "$WILDCAT_STORAGE" "$WILDCAT_DATA"/{postgres,redis,keystores,backup-tmp,tmp,builder,clamav,trivy}
+#   sudo chown -R 1001:1001 "$WILDCAT_STORAGE" "$WILDCAT_DATA"/{keystores,backup-tmp,tmp,builder}
+#
+# Build e avvio:
+#   docker compose build backend && docker compose build
+#   docker compose up -d                        # store
+#   docker compose --profile builder up -d      # + build dei manifest
+#
+# Immagini: di default vengono costruite in locale (wildcat-hub-*). Se usi
+# quelle pubblicate su GHCR dalla CI, imposta nel .env
+#   WILDCAT_IMAGE_PREFIX=ghcr.io/<utente>/wildcat-hub   e   WILDCAT_TAG=<versione>
+#
+# What's Up Docker: in ogni servizio trovi le label wud.* commentate.
+# Scommentale se usi WUD. Le immagini costruite in locale non hanno un
+# registry da controllare (wud.watch=false); backend, worker, builder e
+# frontend vanno aggiornati INSIEME e allo stesso tag; postgres non va mai
+# portato a una major diversa senza dump/restore.
+
+x-paths:
+  storage: &storage ${WILDCAT_STORAGE:-./storage}:/data/storage
+  keystores: &keystores ${WILDCAT_DATA:-./data}/keystores:/data/keystores
+  backup: &backup ${WILDCAT_DATA:-./data}/backup-tmp:/data/backup-tmp
+  tmp: &tmp ${WILDCAT_DATA:-./data}/tmp:/tmp
+  builder: &builder ${WILDCAT_DATA:-./data}/builder:/data/builder
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-wildcat}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-wildcat}
+  REDIS_URL: redis://redis:6379/0
+  CLAMAV_HOST: ${CLAMAV_HOST:-}
+  CLAMAV_PORT: ${CLAMAV_PORT:-3310}
+  CLAMAV_MAX_STREAM_MB: ${CLAMAV_MAX_STREAM_MB:-100}
+  TRIVY_SERVER_URL: ${TRIVY_SERVER_URL:-}
+  GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+  GITLAB_TOKEN: ${GITLAB_TOKEN:-}
+  GITEA_TOKEN: ${GITEA_TOKEN:-}
+  BACKUP_TMP_DIR: /data/backup-tmp
+  GPG_HOME: /data/keystores/gnupg
+  FLATPAK_REPO_PATH: /data/storage/flatpak
+  FLATPAK_REMOTE_NAME: ${FLATPAK_REMOTE_NAME:-wildcat}
+  FLATPAK_RUNTIME_REPO: ${FLATPAK_RUNTIME_REPO:-https://dl.flathub.org/repo/flathub.flatpakrepo}
+  FLATPAK_STATIC_DELTAS: ${FLATPAK_STATIC_DELTAS:-0}
+  BUILDER_WORK_DIR: /data/builder
+
+x-hardening: &hardening
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    labels:
+      - com.wildcat-hub.component=database
+      - com.wildcat-hub.description=PostgreSQL — utenti, app, metadati, audit
+      # What's Up Docker — resta sulla major 16: il passaggio a 17+ richiede
+      # pg_dump / restore, non un semplice pull.
+      # - wud.tag.include=^16-alpine$
+      # - wud.watch.digest=true
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-wildcat}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-wildcat}
+    volumes:
+      - ${WILDCAT_DATA:-./data}/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-wildcat}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    labels:
+      - com.wildcat-hub.component=queue
+      - com.wildcat-hub.description=Redis — coda dei job (arq) e cache
+      # What's Up Docker — solo aggiornamenti dentro la 7.x (digest).
+      # - wud.tag.include=^7-alpine$
+      # - wud.watch.digest=true
+    command: ["redis-server", "--save", "60", "1", "--loglevel", "warning"]
+    volumes:
+      - ${WILDCAT_DATA:-./data}/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Opzionale (profilo "clamav"): antivirus sui bundle caricati.
+  clamav:
+    profiles: ["clamav"]
+    image: clamav/clamav:stable-debian
+    restart: unless-stopped
+    labels:
+      - com.wildcat-hub.component=antivirus
+      - com.wildcat-hub.description=ClamAV — scansione dei bundle (opzionale)
+      # What's Up Docker — tag mobile "stable": segui solo il digest.
+      # - wud.tag.include=^stable-debian$
+      # - wud.watch.digest=true
+    volumes:
+      - ${WILDCAT_DATA:-./data}/clamav:/var/lib/clamav
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 30s
+      timeout: 10s
+      start_period: 5m
+      retries: 5
+
+  backend:
+    image: ${WILDCAT_IMAGE_PREFIX:-wildcat-hub}-backend:${WILDCAT_TAG:-latest}
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    labels:
+      - com.wildcat-hub.component=api
+      - com.wildcat-hub.description=API FastAPI — catalogo, upload, repository OSTree
+      # What's Up Docker — immagine costruita in locale: niente da controllare.
+      # - wud.watch=false
+      # Con le immagini GHCR: solo release semver, da aggiornare insieme a
+      # worker, builder e frontend (stesso tag).
+      # - wud.tag.include=^\d+\.\d+\.\d+$
+    env_file: .env
+    environment:
+      <<: *app-env
+      FORWARDED_ALLOW_IPS: ${FORWARDED_ALLOW_IPS:-127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      X_ACCEL_REDIRECT_ENABLED: ${X_ACCEL_REDIRECT_ENABLED:-1}
+    <<: *hardening
+    tmpfs:
+      - /home/fdroid:rw,size=64m,uid=1001,gid=1001,mode=0700
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - *storage
+      - *keystores
+      - *backup
+      # Upload e lettura dei bundle: su disco, non in RAM.
+      - *tmp
+    # Solo loopback: l'API si fida di X-Forwarded-For.
+    ports:
+      - 127.0.0.1:${BACKEND_PORT:-8012}:8000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  worker:
+    image: ${WILDCAT_IMAGE_PREFIX:-wildcat-hub}-worker:${WILDCAT_TAG:-latest}
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+      args:
+        API_IMAGE: ${WILDCAT_IMAGE_PREFIX:-wildcat-hub}-backend:${WILDCAT_TAG:-latest}
+    restart: unless-stopped
+    labels:
+      - com.wildcat-hub.component=worker
+      - com.wildcat-hub.description=Worker arq — firma e pubblicazione del repo, import, backup
+      # What's Up Docker — deriva dall'immagine backend: stesso tag, sempre insieme.
+      # - wud.watch=false
+      # - wud.tag.include=^\d+\.\d+\.\d+$
+    env_file: .env
+    environment:
+      <<: *app-env
+    command: ["python", "-m", "arq", "app.workers.tasks.WorkerSettings"]
+    <<: *hardening
+    tmpfs:
+      - /home/fdroid:rw,size=64m,uid=1001,gid=1001,mode=0700
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - *storage
+      - *keystores
+      - *backup
+      - *tmp
+      # Legge i bundle prodotti dal builder.
+      - *builder
+    healthcheck:
+      test: ["CMD", "python", "-m", "arq", "app.workers.tasks.WorkerSettings", "--check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # Opzionale (profilo "builder"): build dei manifest con flatpak-builder.
+  # Esegue ricette di terzi: niente database, niente chiave GPG, niente .env,
+  # solo redis e la sua cartella. bubblewrap richiede gli user namespace,
+  # da qui seccomp/apparmor "unconfined". Se la build fallisce con
+  # "bwrap: ... Operation not permitted", come ultima risorsa usa
+  # `privileged: true` al posto di security_opt.
+  builder:
+    profiles: ["builder"]
+    image: ${WILDCAT_IMAGE_PREFIX:-wildcat-hub}-builder:${WILDCAT_TAG:-latest}
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.builder
+      args:
+        API_IMAGE: ${WILDCAT_IMAGE_PREFIX:-wildcat-hub}-backend:${WILDCAT_TAG:-latest}
+    restart: unless-stopped
+    labels:
+      - com.wildcat-hub.component=builder
+      - com.wildcat-hub.description=flatpak-builder — build dei manifest (opzionale)
+      # What's Up Docker — deriva dall'immagine backend: stesso tag, sempre insieme.
+      # - wud.watch=false
+      # - wud.tag.include=^\d+\.\d+\.\d+$
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      BUILDER_WORK_DIR: /data/builder
+      BUILDER_TIMEOUT_S: ${BUILDER_TIMEOUT_S:-7200}
+      FLATPAK_USER_DIR: /data/builder/flatpak
+      # Settings() li richiede per partire; il builder non li usa.
+      SECRET_KEY: builder-has-no-secrets-but-settings-needs-32-chars
+      INITIAL_ADMIN_PASSWORD: builder-unused-placeholder
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+      - systempaths=unconfined
+      # Host con SELinux (Fedora): bwrap non deve riapplicare le label.
+      - label=disable
+    depends_on:
+      redis:
+        condition: service_healthy
+    volumes:
+      - *builder
+    mem_limit: ${BUILDER_MEM_LIMIT:-6g}
+    pids_limit: ${BUILDER_PIDS_LIMIT:-4096}
+
+  # Opzionale (profilo "trivy"): scansione CVE dei bundle.
+  trivy:
+    image: aquasec/trivy:0.70.0
+    profiles: ["trivy"]
+    restart: unless-stopped
+    labels:
+      - com.wildcat-hub.component=cve-scanner
+      - com.wildcat-hub.description=Trivy server — SBOM e CVE dei bundle (opzionale)
+      # What's Up Docker — NON aggiornarlo da solo: la versione del server
+      # deve coincidere con il client trivy dentro l'immagine worker
+      # (TRIVY_IMAGE in backend/Dockerfile.worker). Aggiorna entrambi a mano.
+      # - wud.watch=false
+    command: ["server", "--listen", "0.0.0.0:4954", "--cache-dir", "/cache"]
+    volumes:
+      - ${WILDCAT_DATA:-./data}/trivy:/cache
+    expose:
+      - "4954"
+
+  frontend:
+    image: ${WILDCAT_IMAGE_PREFIX:-wildcat-hub}-frontend:${WILDCAT_TAG:-latest}
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    labels:
+      - com.wildcat-hub.component=web
+      - com.wildcat-hub.description=nginx — GUI, proxy verso l'API e download del repo
+      # TSDProxy (Tailscale): ignorate se non lo usi.
+      - tsdproxy.enable=true
+      - tsdproxy.name=wildcat-hub
+      - tsdproxy.container_port=8080
+      # What's Up Docker — immagine costruita in locale: niente da controllare.
+      # - wud.watch=false
+      # Con le immagini GHCR: stesso tag di backend, worker e builder.
+      # - wud.tag.include=^\d+\.\d+\.\d+$
+    environment:
+      UPSTREAM_BACKEND: backend:8000
+      # HSTS attivo quando il TLS è terminato davanti (TSDProxy, Caddy, …).
+      ENABLE_HSTS: ${ENABLE_HSTS:-1}
+      HSTS_MAX_AGE: ${HSTS_MAX_AGE:-31536000}
+      TRUSTED_PROXY_CIDRS: ${TRUSTED_PROXY_CIDRS:-}
+      API_MAX_BODY_SIZE: ${API_MAX_BODY_SIZE:-10m}
+      UPLOAD_MAX_BODY_SIZE: ${UPLOAD_MAX_BODY_SIZE:-4100m}
+      NGINX_RESOLVER: ${NGINX_RESOLVER:-127.0.0.11}
+    <<: *hardening
+    tmpfs:
+      - /tmp:rw,size=32m,mode=1777
+      - /var/cache/nginx:rw,size=64m,uid=101,gid=101,mode=0700
+      - /etc/nginx/conf.d:rw,size=4m,uid=101,gid=101,mode=0755
+    ports:
+      - ${FRONTEND_PORT:-8096}:8080
+    volumes:
+      - ${WILDCAT_STORAGE:-./storage}:/data/storage:ro
+    depends_on:
+      - backend

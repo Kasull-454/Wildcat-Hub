@@ -1,0 +1,1365 @@
+from __future__ import annotations
+
+import re
+import uuid
+from typing import Annotated
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    status,
+)
+from sqlalchemy import func, or_, select
+from sqlalchemy.orm import selectinload
+
+from app.api.deps import DbSession, get_current_uploader, get_current_user, require_browse_access
+from app.api.v1.apks import (
+    _apk_size_cap_bytes,
+    attach_apk_to_app,
+    parse_or_400,
+    save_upload_to_temp,
+)
+from app.core.database import run_after_commit
+from app.core.download_token import sign_media_token
+from app.core.logging import get_logger
+from app.core.rate_limit import limiter
+from app.models.apk import ApkStatus
+from app.models.app import (
+    NOT_NSFW_APP,
+    App,
+    AppStatus,
+    AppVisibility,
+    Category,
+    Localization,
+)
+from app.models.audit import DownloadEvent
+from app.models.user import User, UserRole
+from app.schemas.apk_proxy import AppCreateFromProxy
+from app.schemas.app import (
+    AppCreate,
+    AppCreateFromGithub,
+    AppCreateFromStagedApk,
+    AppDetail,
+    AppRead,
+    AppUpdate,
+    LocalizationRead,
+    LocalizationUpsert,
+)
+from app.services.queue import enqueue_reindex
+from app.services.suggested_version import recompute_auto
+
+router = APIRouter()
+log = get_logger(__name__)
+
+# Mirrors the ``package_name`` regex in ``AppCreate`` — kept module-level so
+# the multipart endpoint can reuse it without going through the JSON
+# pipeline. Standard Android package id: at least two dot-separated
+# segments, each starting with a letter, alphanumeric + underscore.
+_PACKAGE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*(\.[A-Za-z_][A-Za-z0-9_-]*){2,}$")
+
+
+def _pick_locale_overrides(
+    app: App, preferred_locale: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    """Resolve the caller's preferred locale against ``app.localizations``.
+
+    Returns ``(name, summary, description)`` overrides — values may be None
+    individually when a partial localization only sets some fields, in
+    which case the caller leaves that field at the app-level default.
+
+    Resolution order:
+      1. Exact locale match (``fr-CA`` → fr-CA).
+      2. Language-only match (``fr-CA`` → first row whose primary subtag
+         is ``fr``).
+      3. None — caller should keep the en-US defaults.
+    """
+    if not preferred_locale or not app.localizations:
+        return None, None, None
+    exact = next(
+        (loc for loc in app.localizations if loc.locale == preferred_locale),
+        None,
+    )
+    if exact is None:
+        primary = preferred_locale.split("-", 1)[0].lower()
+        exact = next(
+            (
+                loc for loc in app.localizations
+                if loc.locale.split("-", 1)[0].lower() == primary
+            ),
+            None,
+        )
+    if exact is None:
+        return None, None, None
+    return exact.name, exact.summary, exact.description
+
+
+def _attach_media_token(
+    payload, app: App, user: User | None, *, can_manage: bool = False
+) -> None:
+    """Mint a per-app media token when the caller is allowed to see this
+    app's private images. Anonymous + non-owner callers get ``None``.
+
+    Private-app icons / screenshots / banners are gated by
+    ``_media_anonymously_visible`` in the F-Droid route, which only
+    recognises Basic-auth API keys. Browser ``<img src>`` tags carry no
+    Authorization header, so the SPA needs a query-string token to
+    unlock the same files. This helper is the one place that decides
+    whether to mint it; callers attach the result to the response.
+    """
+    if app.visibility == AppVisibility.PUBLIC:
+        return
+    if user is None:
+        return
+    is_owner = app.owner_id is not None and user.id == app.owner_id
+    if can_manage or user.role == UserRole.ADMIN or is_owner:
+        payload.media_token = sign_media_token(app.package_name, user.id)
+
+
+def _apply_locale(payload, app: App, preferred_locale: str | None):
+    """Overlay localized strings on a freshly serialized AppRead/AppDetail.
+
+    Each field is replaced only when the resolution actually surfaced a
+    non-empty value, so a partial localization that only sets the summary
+    keeps the default name and description.
+    """
+    name, summary, description = _pick_locale_overrides(app, preferred_locale)
+    if name:
+        payload.name = name
+    if summary:
+        payload.summary = summary
+    if description:
+        payload.description = description
+    return payload
+
+
+def _app_visible_to(app: App, user: User | None, *, can_manage: bool = False) -> bool:
+    """Public published apps are visible to anyone. Otherwise the requester
+    must be able to manage the app (owner, co-maintainer or admin)."""
+    if app.visibility == AppVisibility.PUBLIC and app.status == AppStatus.PUBLISHED:
+        return True
+    if user is None:
+        return False
+    if can_manage or user.role == UserRole.ADMIN:
+        return True
+    return app.owner_id == user.id
+
+
+@router.get("", response_model=list[AppRead])
+async def list_apps(
+    db: DbSession,
+    user: Annotated[User | None, Depends(require_browse_access)],
+    q: str | None = Query(default=None, max_length=200),
+    category: str | None = Query(default=None, max_length=64),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> list[AppRead]:
+    """Browse apps. Anonymous callers only see PUBLIC + PUBLISHED apps; they
+    are rejected outright when the repo is not in public mode. NSFW-flagged
+    apps are hidden unless the caller has opted in via ``show_nsfw``."""
+    stmt = (
+        select(App)
+        .options(
+            selectinload(App.categories),
+            selectinload(App.apks),
+            selectinload(App.localizations),
+        )
+        .order_by(App.last_published_at.desc().nullslast(), App.name)
+    )
+    if user is None or user.role != UserRole.ADMIN:
+        # Public listing: PUBLIC + PUBLISHED
+        stmt = stmt.where(
+            App.visibility == AppVisibility.PUBLIC,
+            App.status == AppStatus.PUBLISHED,
+        )
+
+    if q:
+        like = f"%{q}%"
+        stmt = stmt.where(or_(App.name.ilike(like), App.summary.ilike(like), App.package_name.ilike(like)))
+    if category:
+        stmt = stmt.join(App.categories).where(Category.name == category)
+    if not (user and user.show_nsfw):
+        stmt = stmt.where(NOT_NSFW_APP)
+
+    stmt = stmt.limit(min(limit, 200)).offset(offset)
+    rows = (await db.execute(stmt)).scalars().unique().all()
+    preferred_locale = user.preferred_locale if user else None
+    out = []
+    for a in rows:
+        p = _apply_locale(AppRead.model_validate(a), a, preferred_locale)
+        _attach_media_token(p, a, user)
+        out.append(p)
+    return out
+
+
+@router.post("/with-apk", response_model=AppDetail, status_code=status.HTTP_201_CREATED)
+async def create_app_with_apk(
+    db: DbSession,
+    user: Annotated[User, Depends(get_current_uploader)],
+    file: UploadFile = File(...),
+    name: str = Form(..., min_length=1, max_length=255),
+    package_name: str | None = Form(default=None, max_length=255),
+    summary: str | None = Form(default=None, max_length=255),
+    description: str | None = Form(default=None, max_length=20_000),
+    license: str | None = Form(default=None, max_length=128),
+    website: str | None = Form(default=None, max_length=512),
+    source_code: str | None = Form(default=None, max_length=512),
+    issue_tracker: str | None = Form(default=None, max_length=512),
+    author_name: str | None = Form(default=None, max_length=255),
+    visibility: str = Form(default="public", max_length=16),
+) -> AppDetail:
+    """Create an App + attach an APK in one multipart request.
+
+    All form fields run through the same constraints as ``AppCreate``
+    (length caps, enum validation) so this multipart path can't be used
+    to bypass the JSON Pydantic validation. URL fields are validated as
+    proper http(s) URLs to avoid storing ``javascript:`` etc. that would
+    later become an XSS surface.
+    """
+    try:
+        visibility_enum = AppVisibility(visibility)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="visibility must be 'public' or 'private'",
+        ) from exc
+
+    # URL fields: reuse Pydantic's HttpUrl validator so we reject
+    # ``javascript:``, ``data:``, mailto, and other non-http schemes.
+    from pydantic import HttpUrl as _HttpUrl
+    from pydantic import ValidationError as _VErr
+
+    def _check_url(value: str | None, label: str) -> str | None:
+        if not value:
+            return None
+        try:
+            return str(_HttpUrl(value))
+        except _VErr as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{label} must be an http(s) URL",
+            ) from exc
+
+    website = _check_url(website, "website")
+    source_code = _check_url(source_code, "source_code")
+    issue_tracker = _check_url(issue_tracker, "issue_tracker")
+
+    from app.services.quotas import ensure_can_create_app, ensure_can_upload_apk
+
+    await ensure_can_create_app(db, user)
+    tmp_path = await save_upload_to_temp(file, max_bytes=await _apk_size_cap_bytes(db))
+    try:
+        await ensure_can_upload_apk(db, user, incoming_size_bytes=tmp_path.stat().st_size)
+        # Apply the same opt-in clamd scan as ``/apks/upload`` so the
+        # combined "create + upload" endpoint can't be used to bypass it.
+        from app.api.v1.apks import _maybe_scan_upload as _apks_scan
+
+        await _apks_scan(db, tmp_path=tmp_path)
+        meta = await parse_or_400(tmp_path)
+        pkg = (package_name or meta.package_name).strip()
+        # Enforce the same package-name regex used on the JSON path; an
+        # APK manifest with a wonky package would otherwise slip through.
+        if not _PACKAGE_NAME_RE.match(pkg):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="app ID must be a valid Flatpak application ID (e.g. org.example.App)",
+            )
+        if pkg != meta.package_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"package_name {pkg!r} does not match the APK manifest "
+                    f"({meta.package_name!r})"
+                ),
+            )
+        if (
+            await db.execute(select(App).where(App.package_name == pkg))
+        ).scalar_one_or_none() is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Package {pkg} already exists",
+            )
+
+        app = App(
+            package_name=pkg,
+            name=name,
+            summary=summary,
+            description=description,
+            license=license,
+            website=website,
+            source_code=source_code,
+            issue_tracker=issue_tracker,
+            author_name=author_name,
+            visibility=visibility_enum,
+            status=AppStatus.DRAFT,
+            owner_id=user.id,
+            apks=[],
+            screenshots=[],  # initialise to avoid lazy-load during index build
+        )
+        db.add(app)
+        await db.flush()
+
+        apk = await attach_apk_to_app(
+            db, app=app, tmp_path=tmp_path, meta=meta, uploader=user
+        )
+        # Retention enforcement — no-op on a fresh app with one APK,
+        # but kept here so all attach paths share the same hook.
+        from app.services.apk_eviction import evict_oldest_if_needed
+        await evict_oldest_if_needed(db, app=app, actor_id=user.id, keep=apk.id)
+        if apk.status == ApkStatus.PUBLISHED:
+            await enqueue_reindex()
+
+        # Reload with eager relationships for the response.
+        # populate_existing forces SQLAlchemy to overwrite the identity-map
+        # cache so the just-added APK shows up in app.apks.
+        result = (
+            await db.execute(
+                select(App)
+                .execution_options(populate_existing=True)
+                .options(
+                    selectinload(App.categories),
+                    selectinload(App.apks),
+                    selectinload(App.owner),
+                    selectinload(App.screenshots),
+                    # ``AppDetail.localizations`` is read during model_validate
+                    # below — without this the sync Pydantic walker triggers a
+                    # lazy load and SQLAlchemy raises ``MissingGreenlet``.
+                    # The two sibling create paths (with-github-source,
+                    # patch) already eager-load it; this one was the outlier.
+                    selectinload(App.localizations),
+                )
+                .where(App.id == app.id)
+            )
+        ).scalar_one()
+        payload = AppDetail.model_validate(result)
+        payload.owner_username = result.owner.username if result.owner else None
+        _attach_media_token(payload, result, user)
+        return payload
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+@router.post(
+    "/with-staged-apk",
+    response_model=AppDetail,
+    status_code=status.HTTP_201_CREATED,
+)
+@limiter.limit("10/minute")
+async def create_app_with_staged_apk(
+    request: Request,
+    payload: AppCreateFromStagedApk,
+    db: DbSession,
+    user: Annotated[User, Depends(get_current_uploader)],
+) -> AppDetail:
+    """Mirror of :func:`create_app_with_apk` that redeems a staging
+    token (from ``POST /apks/inspect``) instead of accepting a fresh
+    multipart upload. Cuts the create flow's network cost in half for
+    large APKs — the bytes are already on the server.
+    """
+    from app.api.v1.apks import (
+        _discard_staged_apk,
+        _materialise_staged_apk,
+        _maybe_scan_upload,
+        attach_apk_to_app,
+        parse_or_400,
+    )
+    from app.services.quotas import ensure_can_create_app, ensure_can_upload_apk
+
+    await ensure_can_create_app(db, user)
+    tmp_path, content_hash = await _materialise_staged_apk(
+        payload.staging_token, user_id=user.id,
+    )
+    try:
+        # Drop the staged blob on EVERY exit path (success → promoted,
+        # failure → don't orphan in storage forever). See the matching
+        # comment in ``upload_apk_staged``.
+        await ensure_can_upload_apk(db, user, incoming_size_bytes=tmp_path.stat().st_size)
+        await _maybe_scan_upload(db, tmp_path=tmp_path)
+        meta = await parse_or_400(tmp_path)
+        if meta.sha256 != content_hash:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Staged content hash does not match parsed APK",
+            )
+        pkg = (payload.package_name or meta.package_name).strip()
+        if not _PACKAGE_NAME_RE.match(pkg):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="app ID must be a valid Flatpak application ID (e.g. org.example.App)",
+            )
+        if pkg != meta.package_name:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"package_name {pkg!r} does not match the APK manifest "
+                    f"({meta.package_name!r})"
+                ),
+            )
+        if (
+            await db.execute(select(App).where(App.package_name == pkg))
+        ).scalar_one_or_none() is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Package {pkg} already exists",
+            )
+
+        app = App(
+            package_name=pkg,
+            name=payload.name,
+            summary=payload.summary,
+            description=payload.description,
+            license=payload.license,
+            website=str(payload.website) if payload.website else None,
+            source_code=str(payload.source_code) if payload.source_code else None,
+            issue_tracker=str(payload.issue_tracker) if payload.issue_tracker else None,
+            author_name=payload.author_name,
+            visibility=payload.visibility,
+            status=AppStatus.DRAFT,
+            owner_id=user.id,
+            apks=[],
+            screenshots=[],
+        )
+        db.add(app)
+        await db.flush()
+
+        apk = await attach_apk_to_app(
+            db, app=app, tmp_path=tmp_path, meta=meta, uploader=user,
+        )
+        from app.services.apk_eviction import evict_oldest_if_needed
+        await evict_oldest_if_needed(db, app=app, actor_id=user.id, keep=apk.id)
+        if apk.status == ApkStatus.PUBLISHED:
+            await enqueue_reindex()
+
+        result = (
+            await db.execute(
+                select(App)
+                .execution_options(populate_existing=True)
+                .options(
+                    selectinload(App.categories),
+                    selectinload(App.apks),
+                    selectinload(App.owner),
+                    selectinload(App.screenshots),
+                    selectinload(App.localizations),
+                )
+                .where(App.id == app.id)
+            )
+        ).scalar_one()
+        payload_out = AppDetail.model_validate(result)
+        payload_out.owner_username = result.owner.username if result.owner else None
+        _attach_media_token(payload_out, result, user)
+        return payload_out
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        await _discard_staged_apk(content_hash)
+
+
+@router.post("/with-github-source", response_model=AppDetail, status_code=status.HTTP_201_CREATED)
+@limiter.limit("10/minute")
+async def create_app_with_github_source(
+    request: Request,
+    payload: AppCreateFromGithub,
+    db: DbSession,
+    user: Annotated[User, Depends(get_current_uploader)],
+) -> AppDetail:
+    """Create an App + first APK + GithubSource in one shot.
+
+    Mirror of :func:`create_app_with_apk` but the APK comes from a
+    GitHub release. The repo is re-resolved + re-downloaded server-side
+    so the client can't smuggle a tampered binary through the inspect
+    response. After creation the daily cron will keep this app in sync
+    with the configured repo.
+    """
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from app.models.github_source import GithubProvider, GithubSource, GithubSourceStatus
+    from app.services.crypto import encrypt as _encrypt_token
+    from app.services.github_releases import (
+        GithubReleaseError,
+        download_asset,
+        fetch_repo_metadata,
+        find_latest_asset,
+        validate_base_url,
+        validate_repo,
+    )
+    from app.services.quotas import ensure_can_create_app, ensure_can_upload_apk
+
+    try:
+        repo = validate_repo(payload.repo)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    try:
+        base_url = validate_base_url(payload.base_url)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+    provider_name = (payload.provider or "github").lower()
+    try:
+        provider_enum = GithubProvider(provider_name)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Unknown provider: {provider_name!r}",
+        ) from exc
+
+    pattern = (payload.asset_pattern or "").strip() or None
+    raw_token = (payload.access_token or "").strip() or None
+
+    await ensure_can_create_app(db, user)
+
+    # 1. Resolve + download the matching release asset.
+    try:
+        asset = await find_latest_asset(
+            repo,
+            asset_pattern=pattern,
+            include_prereleases=payload.include_prereleases,
+            provider=provider_name,
+            base_url=base_url,
+            token=raw_token,
+        )
+    except GithubReleaseError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    if asset is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"No release with a matching APK found for {repo!r}"
+            ),
+        )
+
+    # Best-effort repo metadata fetch — feeds the server-side defaults
+    # for the listing fields the user didn't explicitly set.
+    repo_meta = await fetch_repo_metadata(
+        repo, provider=provider_name, base_url=base_url, token=raw_token
+    )
+
+    try:
+        tmp_path = await download_asset(asset, max_bytes=await _apk_size_cap_bytes(db))
+    except GithubReleaseError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+
+    try:
+        # 2. Quota + AV scan + parse, identical to the manual-upload path.
+        await ensure_can_upload_apk(db, user, incoming_size_bytes=tmp_path.stat().st_size)
+        from app.api.v1.apks import _maybe_scan_upload as _apks_scan
+
+        await _apks_scan(db, tmp_path=tmp_path)
+        meta = await parse_or_400(tmp_path)
+        if not _PACKAGE_NAME_RE.match(meta.package_name):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="parsed app ID is not a valid Flatpak application ID",
+            )
+        if (
+            await db.execute(select(App).where(App.package_name == meta.package_name))
+        ).scalar_one_or_none() is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Package {meta.package_name} already exists",
+            )
+
+        # 3. Create the App + first Apk row. When the caller leaves a
+        # listing field empty AND GitHub has a value for it, we fill it
+        # — the explicit-empty case (an API client that wants to keep
+        # the field blank) is indistinguishable from "not provided", so
+        # we err on the side of "more populated is more useful".
+        gh_summary = repo_meta.description if repo_meta else None
+        gh_homepage = repo_meta.homepage if repo_meta else None
+        gh_license = repo_meta.license_spdx if repo_meta else None
+        gh_owner_login = repo_meta.owner_login if repo_meta else None
+        gh_html_url = repo_meta.html_url if repo_meta else f"https://github.com/{repo}"
+
+        app = App(
+            package_name=meta.package_name,
+            name=payload.name,
+            summary=payload.summary or gh_summary,
+            description=payload.description,
+            license=payload.license or gh_license,
+            website=str(payload.website) if payload.website else gh_homepage,
+            source_code=str(payload.source_code) if payload.source_code else gh_html_url,
+            issue_tracker=str(payload.issue_tracker) if payload.issue_tracker else None,
+            author_name=payload.author_name or gh_owner_login,
+            visibility=payload.visibility,
+            status=AppStatus.DRAFT,
+            owner_id=user.id,
+            apks=[],
+            screenshots=[],
+            localizations=[],
+        )
+        db.add(app)
+        await db.flush()
+
+        # Same channel mapping as the cron import: a forge pre-release is a
+        # beta (offered to everyone anyway until a stable release exists).
+        apk = await attach_apk_to_app(
+            db, app=app, tmp_path=tmp_path, meta=meta, uploader=user,
+            is_beta=asset.is_prerelease,
+        )
+        # Retention enforcement (no-op on a fresh app with one APK).
+        from app.services.apk_eviction import evict_oldest_if_needed
+        await evict_oldest_if_needed(db, app=app, actor_id=user.id, keep=apk.id)
+
+        # 4. Wire the persistent GithubSource so the cron can keep
+        # importing future releases. Snapshot the just-imported tag so
+        # the next scan considers it up_to_date instead of re-importing.
+        db.add(
+            GithubSource(
+                app_id=app.id,
+                repo=repo,
+                provider=provider_enum,
+                base_url=base_url,
+                asset_pattern=pattern,
+                include_prereleases=payload.include_prereleases,
+                enabled=True,
+                last_release_tag=asset.release_tag,
+                last_release_published_at=asset.release_published_at,
+                last_scanned_at=_dt.now(_UTC),
+                last_status=GithubSourceStatus.IMPORTED,
+                created_by=user.id,
+                # Encrypt + persist the PAT alongside the source so the
+                # daily cron uses the same credential. None means the
+                # cron falls back to the env-var default.
+                access_token_encrypted=_encrypt_token(raw_token) if raw_token else None,
+            )
+        )
+
+        if apk.status == ApkStatus.PUBLISHED:
+            await enqueue_reindex()
+
+        # 5. Reload with eager relationships for the response. We must
+        # also hydrate ``localizations`` because AppDetail iterates it
+        # during serialisation and a lazy load inside an async context
+        # would raise MissingGreenlet.
+        result = (
+            await db.execute(
+                select(App)
+                .execution_options(populate_existing=True)
+                .options(
+                    selectinload(App.categories),
+                    selectinload(App.apks),
+                    selectinload(App.owner),
+                    selectinload(App.screenshots),
+                    selectinload(App.localizations),
+                )
+                .where(App.id == app.id)
+            )
+        ).scalar_one()
+        out = AppDetail.model_validate(result)
+        out.owner_username = result.owner.username if result.owner else None
+        _attach_media_token(out, result, user)
+        return out
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+@router.post("/with-proxy-source", response_model=AppDetail, status_code=status.HTTP_201_CREATED)
+@limiter.limit("10/minute")
+async def create_app_with_proxy_source(
+    request: Request,
+    payload: AppCreateFromProxy,
+    db: DbSession,
+    user: Annotated[User, Depends(get_current_uploader)],
+) -> AppDetail:
+    """Create an App + first APK + ApkProxySource in one shot.
+
+    Mirror of :func:`create_app_with_github_source` but the APK comes
+    from a configured proxy (F-Droid mirror, Patreon, private artefact registry, …).
+    The proxy is re-resolved + re-downloaded server-side so the client
+    can't smuggle a tampered binary through the inspect response.
+
+    After creation the daily proxy cron will keep this app in sync with
+    upstream the same way it does for sources attached via the per-app
+    wizard.
+    """
+    import json as _json
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    from app.models.apk_proxy import (
+        ApkProxy,
+        ApkProxyHealthStatus,
+        ApkProxySource,
+        ApkProxySourceStatus,
+    )
+    from app.schemas.apk_proxy import ResolveResponse
+    from app.services.apk_proxy_client import ApkProxyError, resolve
+    from app.services.apk_proxy_download import download_apk, verify_sha256_hint
+    from app.services.crypto import encrypt as _encrypt
+    from app.services.quotas import ensure_can_create_app, ensure_can_upload_apk
+
+    # ---- 1. Validate proxy + provider ---------------------------------
+    proxy = (
+        await db.execute(select(ApkProxy).where(ApkProxy.id == payload.proxy_id))
+    ).scalar_one_or_none()
+    if proxy is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Proxy not found",
+        )
+    if not proxy.enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="That proxy is disabled.",
+        )
+    if proxy.last_health_status != ApkProxyHealthStatus.HEALTHY:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="That proxy is not healthy. Ask an admin to fix or refresh it.",
+        )
+    catalogue = proxy.cached_sources_json or {}
+    providers = catalogue.get("providers", []) if isinstance(catalogue, dict) else []
+    if not any(
+        isinstance(p, dict) and p.get("id") == payload.provider for p in providers
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Provider {payload.provider!r} is not in this proxy's catalogue. "
+                "Refresh the proxy or pick a different one."
+            ),
+        )
+
+    await ensure_can_create_app(db, user)
+
+    # ---- 2. Resolve + download ---------------------------------------
+    try:
+        resolved: ResolveResponse | None = await resolve(
+            proxy,
+            provider=payload.provider,
+            url=str(payload.source_url),
+            last_release_id=None,  # New-app flow: always a fresh resolve.
+            secrets=payload.secrets or {},
+        )
+    except ApkProxyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    if resolved is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Proxy {proxy.name!r} returned no release for {payload.source_url!r}."
+            ),
+        )
+
+    max_bytes = await _apk_size_cap_bytes(db)
+    if (
+        resolved.apk_size_bytes is not None
+        and resolved.apk_size_bytes > max_bytes
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Proxy advertised {resolved.apk_size_bytes} B; "
+                f"the configured cap is {max_bytes} B."
+            ),
+        )
+    try:
+        tmp_path = await download_apk(
+            apk_url=str(resolved.apk_url),
+            headers=resolved.apk_headers,
+            max_bytes=max_bytes,
+        )
+    except ApkProxyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Download failed: {exc}",
+        ) from exc
+
+    try:
+        # ---- 3. Quota + AV scan + parse + cross-checks ------------------
+        await ensure_can_upload_apk(db, user, incoming_size_bytes=tmp_path.stat().st_size)
+        from app.api.v1.apks import _maybe_scan_upload as _apks_scan
+
+        await _apks_scan(db, tmp_path=tmp_path)
+        if resolved.apk_sha256_hint:
+            try:
+                verify_sha256_hint(tmp_path, resolved.apk_sha256_hint)
+            except ApkProxyError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=str(exc),
+                ) from exc
+        meta = await parse_or_400(tmp_path)
+        if not _PACKAGE_NAME_RE.match(meta.package_name):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="parsed app ID is not a valid Flatpak application ID",
+            )
+        if meta.version_code != resolved.version_code:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"Manifest versionCode {meta.version_code} != "
+                    f"proxy-advertised {resolved.version_code}"
+                ),
+            )
+        if (
+            await db.execute(select(App).where(App.package_name == meta.package_name))
+        ).scalar_one_or_none() is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Package {meta.package_name} already exists",
+            )
+
+        # ---- 4. Create App + Apk row ---------------------------------
+        # Proxy resolve doesn't return repo-level metadata, so the
+        # listing fields fall back to the user's input only (no GitHub-
+        # style auto-fill). If they leave a field blank, it stays blank.
+        app = App(
+            package_name=meta.package_name,
+            name=payload.name,
+            summary=payload.summary,
+            description=payload.description,
+            license=payload.license,
+            website=str(payload.website) if payload.website else None,
+            source_code=str(payload.source_code) if payload.source_code else None,
+            issue_tracker=str(payload.issue_tracker) if payload.issue_tracker else None,
+            author_name=payload.author_name,
+            visibility=payload.visibility,
+            status=AppStatus.DRAFT,
+            owner_id=user.id,
+            apks=[],
+            screenshots=[],
+            localizations=[],
+        )
+        db.add(app)
+        await db.flush()
+
+        apk = await attach_apk_to_app(
+            db, app=app, tmp_path=tmp_path, meta=meta, uploader=user
+        )
+        from app.services.apk_eviction import evict_oldest_if_needed
+        await evict_oldest_if_needed(db, app=app, actor_id=user.id, keep=apk.id)
+
+        # ---- 5. Wire the persistent ApkProxySource ------------------
+        # Snapshot the just-imported release so the cron sees it as
+        # up_to_date next tick instead of re-importing.
+        db.add(
+            ApkProxySource(
+                app_id=app.id,
+                proxy_id=proxy.id,
+                provider=payload.provider,
+                source_url=str(payload.source_url),
+                # Encrypt the (now-validated) secrets blob. Empty dict =
+                # NULL on disk so the row reads as "no auth configured".
+                secrets_encrypted=(
+                    _encrypt(_json.dumps(payload.secrets, sort_keys=True))
+                    if payload.secrets
+                    else None
+                ),
+                enabled=True,
+                last_release_id=resolved.release_id,
+                last_release_at=resolved.published_at or _dt.now(_UTC),
+                last_scanned_at=_dt.now(_UTC),
+                last_status=ApkProxySourceStatus.IMPORTED,
+                created_by=user.id,
+            )
+        )
+
+        if apk.status == ApkStatus.PUBLISHED:
+            await enqueue_reindex()
+
+        # ---- 6. Reload with eager relationships for the response ----
+        result = (
+            await db.execute(
+                select(App)
+                .execution_options(populate_existing=True)
+                .options(
+                    selectinload(App.categories),
+                    selectinload(App.apks),
+                    selectinload(App.owner),
+                    selectinload(App.screenshots),
+                    selectinload(App.localizations),
+                )
+                .where(App.id == app.id)
+            )
+        ).scalar_one()
+        out = AppDetail.model_validate(result)
+        out.owner_username = result.owner.username if result.owner else None
+        _attach_media_token(out, result, user)
+        return out
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
+@router.post("/import-metadata")
+async def import_metadata(
+    payload: dict,
+    user: Annotated[User, Depends(get_current_uploader)],
+) -> dict:
+    """Parse a pasted ``metadata.yml`` (fdroiddata upstream format) and
+    return a flat dict the New App page can use to prefill its fields.
+
+    Body: ``{"yaml": "<the raw metadata.yml content>"}``.
+
+    Returns the parsed dict — no DB writes. The user is responsible for
+    reviewing the prefilled values before submitting the actual create
+    request. We don't try to match category names against the local
+    taxonomy here (the UI does that with its loaded category list).
+    """
+    from app.services.metadata_import import parse_metadata_yaml
+
+    raw = payload.get("yaml") if isinstance(payload, dict) else None
+    if not isinstance(raw, str):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Body must be {\"yaml\": \"...\"}",
+        )
+    return parse_metadata_yaml(raw)
+
+
+@router.post("", response_model=AppRead, status_code=status.HTTP_201_CREATED)
+async def create_app(
+    payload: AppCreate,
+    db: DbSession,
+    user: Annotated[User, Depends(get_current_uploader)],
+) -> AppRead:
+    from app.services.quotas import ensure_can_create_app
+
+    await ensure_can_create_app(db, user)
+    existing = (
+        await db.execute(select(App).where(App.package_name == payload.package_name))
+    ).scalar_one_or_none()
+    if existing is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Package {payload.package_name} already exists",
+        )
+
+    categories: list[Category] = []
+    if payload.category_ids:
+        categories = list(
+            (
+                await db.execute(select(Category).where(Category.id.in_(payload.category_ids)))
+            ).scalars().all()
+        )
+
+    app = App(
+        package_name=payload.package_name,
+        name=payload.name,
+        summary=payload.summary,
+        description=payload.description,
+        license=payload.license,
+        website=str(payload.website) if payload.website else None,
+        source_code=str(payload.source_code) if payload.source_code else None,
+        issue_tracker=str(payload.issue_tracker) if payload.issue_tracker else None,
+        author_name=payload.author_name,
+        author_email=payload.author_email or None,
+        donate=payload.donate or None,
+        liberapay=payload.liberapay or None,
+        bitcoin=payload.bitcoin or None,
+        open_collective=payload.open_collective or None,
+        translation=payload.translation or None,
+        visibility=payload.visibility,
+        status=AppStatus.DRAFT,
+        owner_id=user.id,
+        categories=categories,
+    )
+    db.add(app)
+    await db.flush()
+    # Re-query with ``selectinload(App.categories)`` before Pydantic
+    # walks the instance. ``AppRead.categories`` is a list of
+    # CategoryRead; without the eager load the sync attribute access
+    # triggers SQLAlchemy's async lazy-loader, which raises
+    # ``MissingGreenlet`` from the FastAPI response thread. The two
+    # ``create_app_with_*`` siblings already do this — this single-
+    # APK-free create path was the outlier.
+    # ``populate_existing=True`` forces SQLAlchemy to overwrite the
+    # identity-map cache for this row. Without it the re-query returns
+    # the SAME ORM instance we just inserted — still without
+    # ``categories`` / ``apks`` eagerly loaded — and Pydantic walks
+    # straight into the lazy load.
+    #
+    # ``apks`` matters because ``App.is_nsfw`` (rendered as
+    # ``AppRead.is_nsfw``) is a ``@property`` that iterates over
+    # ``self.apks``. Without the eager load the @property triggers a
+    # lazy load in the Pydantic sync walker — the visible attribute
+    # is scalar but the path to it is async I/O.
+    result = (
+        await db.execute(
+            select(App)
+            .execution_options(populate_existing=True)
+            .options(
+                selectinload(App.categories),
+                selectinload(App.apks),
+            )
+            .where(App.id == app.id)
+        )
+    ).scalar_one()
+    payload = AppRead.model_validate(result)
+    _attach_media_token(payload, result, user)
+    return payload
+
+
+async def _load_app_or_404(db, app_id_or_pkg: str) -> App:
+    stmt = select(App).options(
+        selectinload(App.categories),
+        selectinload(App.apks),
+        selectinload(App.owner),
+        selectinload(App.screenshots),
+        selectinload(App.localizations),
+        # github_source is a 1:1 backref — pulling it eagerly costs one
+        # extra round-trip and lets the YAML export endpoint render the
+        # ``Repo:`` field without re-querying.
+        selectinload(App.github_source),
+    )
+    try:
+        pk = uuid.UUID(app_id_or_pkg)
+        stmt = stmt.where(App.id == pk)
+    except ValueError:
+        stmt = stmt.where(App.package_name == app_id_or_pkg)
+    app = (await db.execute(stmt)).scalar_one_or_none()
+    if app is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="App not found")
+    return app
+
+
+@router.get("/{app_ref}", response_model=AppDetail)
+async def get_app(
+    app_ref: str,
+    db: DbSession,
+    user: Annotated[User | None, Depends(require_browse_access)],
+    raw: bool = Query(
+        default=False,
+        description="Skip preferred-locale overlay and return the canonical "
+        "en-US fields. Used by the owner edit form so saving doesn't write "
+        "the localized strings back into the default columns.",
+    ),
+) -> AppDetail:
+    from app.services.app_permissions import can_manage_app
+
+    app = await _load_app_or_404(db, app_ref)
+    can_manage = user is not None and await can_manage_app(db, user, app)
+    if not _app_visible_to(app, user, can_manage=can_manage):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="App not found")
+    download_count = int(
+        (
+            await db.execute(
+                select(func.count(DownloadEvent.id)).where(DownloadEvent.app_id == app.id)
+            )
+        ).scalar_one()
+    )
+    payload = AppDetail.model_validate(app)
+    if not can_manage:
+        # Pending / rejected uploads (and the moderator's notes) are for
+        # the people who manage the app, not for every visitor.
+        payload.apks = [a for a in payload.apks if a.status == ApkStatus.PUBLISHED]
+    payload.owner_username = app.owner.username if app.owner else None
+    payload.download_count = download_count
+    _attach_media_token(payload, app, user, can_manage=can_manage)
+    # Resolved retention cap — computed server-side so the manage
+    # page banner doesn't need to fetch admin-only RepoConfig. We
+    # also surface the raw repo default so the admin override input
+    # can render "Repo default: N" as guidance.
+    from app.models.repo_config import RepoConfig
+    from app.services.apk_eviction import effective_max_versions
+    _cfg = (await db.execute(select(RepoConfig).limit(1))).scalar_one_or_none()
+    payload.effective_max_versions = effective_max_versions(app, _cfg)
+    payload.repo_default_max_versions = _cfg.default_max_versions_per_app if _cfg else None
+    if not raw:
+        _apply_locale(payload, app, user.preferred_locale if user else None)
+    return payload
+
+
+@router.patch("/{app_id}", response_model=AppRead)
+async def update_app(
+    app_id: uuid.UUID,
+    payload: AppUpdate,
+    db: DbSession,
+    user: Annotated[User, Depends(get_current_uploader)],
+) -> AppRead:
+    from app.services.app_permissions import assert_can_manage_app, is_owner_or_admin
+
+    app = await _load_app_or_404(db, str(app_id))
+    await assert_can_manage_app(db, user, app)
+    # Visibility flips are owner-only — co-maintainers shouldn't be able to
+    # unpublish a public app or expose a private one.
+    if (
+        payload.visibility is not None
+        and payload.visibility != app.visibility
+        and not is_owner_or_admin(user, app)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the owner can change visibility",
+        )
+
+    if payload.name is not None:
+        app.name = payload.name
+    # Optional fields: omitted = unchanged, explicit null (or "") = cleared.
+    for field in _CLEARABLE_APP_FIELDS:
+        if field in payload.model_fields_set:
+            value = getattr(payload, field)
+            setattr(app, field, str(value) if value else None)
+    if payload.visibility is not None:
+        app.visibility = payload.visibility
+    if payload.category_ids is not None:
+        cats = list(
+            (
+                await db.execute(select(Category).where(Category.id.in_(payload.category_ids)))
+            ).scalars().all()
+        )
+        app.categories = cats
+    # ``model_fields_set`` lets us distinguish "field omitted" from
+    # "explicitly null" — the latter clears the manual pin and reverts to
+    # auto-tracking.
+    if "suggested_version_code" in payload.model_fields_set:
+        await _apply_suggested_version_override(app, payload.suggested_version_code)
+
+    await db.flush()
+    await enqueue_reindex()
+    payload = AppRead.model_validate(app)
+    _attach_media_token(payload, app, user)
+    return payload
+
+
+_CLEARABLE_APP_FIELDS = (
+    "summary",
+    "description",
+    "license",
+    "website",
+    "source_code",
+    "issue_tracker",
+    "author_name",
+    "author_email",
+    "donate",
+    "liberapay",
+    "bitcoin",
+    "open_collective",
+    "translation",
+)
+
+
+async def _apply_suggested_version_override(
+    app: App, version_code: int | None,
+) -> None:
+    """Set or clear the manually-pinned suggested version.
+
+    Pinning to a concrete ``version_code`` is only allowed when a published
+    APK on the same app actually carries it — otherwise the F-Droid client
+    would advertise a version that nobody can install. Passing ``None``
+    clears the pin and re-runs the auto-bump against whatever's published
+    today so the recommended version snaps to the highest published code.
+    """
+    if version_code is None:
+        app.suggested_version_is_manual = False
+        # Auto-tracking skips beta uploads (see services.suggested_version).
+        recompute_auto(app)
+        return
+
+    target = next(
+        (a for a in app.apks if a.version_code == version_code and a.status == ApkStatus.PUBLISHED),
+        None,
+    )
+    if target is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "suggested_version_code must match a published APK on this app."
+            ),
+        )
+    app.suggested_version_is_manual = True
+    app.suggested_version_code = target.version_code
+    app.suggested_version_name = target.version_name
+    # Recommending a beta to everyone is a promotion: drop the flag so it
+    # stays stable if the owner later switches back to auto-tracking.
+    target.is_beta = False
+
+
+@router.delete("/{app_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None, response_class=Response)
+async def delete_app(
+    app_id: uuid.UUID,
+    db: DbSession,
+    user: Annotated[User, Depends(get_current_uploader)],
+) -> None:
+    from app.services.app_permissions import assert_owner_or_admin
+
+    app = await _load_app_or_404(db, str(app_id))
+    # Delete is owner-only — co-maintainers must never be able to wipe an
+    # app they don't own. Admins still bypass.
+    assert_owner_or_admin(user, app)
+    keys = [a.storage_key for a in app.apks]
+    keys += [s.storage_key for s in app.screenshots]
+    keys += [
+        k
+        for k in (app.icon_path, app.feature_graphic_path, app.promo_graphic_path, app.tv_banner_path)
+        if k
+    ]
+    await db.delete(app)
+    await db.flush()
+
+    async def _purge() -> None:
+        from app.storage import get_storage
+
+        storage = get_storage()
+        for key in keys:
+            try:
+                await storage.delete(key)
+            except Exception as exc:  # noqa: BLE001 — best effort, the rows are gone
+                log.warning("could not delete stored file", key=key, error=str(exc))
+
+    # Files go only once the deletion is committed; the index stops listing
+    # the app (its APK URLs would 404 otherwise).
+    run_after_commit(f"purge-app:{app_id}", _purge)
+    await enqueue_reindex()
+
+
+# --------------------------------------------------------------------------
+# Localizations — per-locale overrides on top of the app-level defaults.
+# --------------------------------------------------------------------------
+
+# BCP47 locale tag: a primary subtag (2-3 letters or 4-letter script-like),
+# optionally followed by a region subtag. Kept tight enough to reject obvious
+# garbage in the URL while still accepting anything F-Droid clients honour
+# (e.g. ``en``, ``en-US``, ``pt-BR``, ``zh-Hans``).
+_LOCALE_RE = re.compile(r"^[a-zA-Z]{2,3}(-[A-Za-z0-9]{2,4})?$")
+
+
+@router.get("/{app_id}/metadata.yml", response_class=Response)
+async def export_metadata_yaml(
+    app_id: uuid.UUID,
+    db: DbSession,
+    user: Annotated[User, Depends(get_current_uploader)],
+) -> Response:
+    """Download the F-Droid ``metadata.yml`` for an app.
+
+    Permission mirrors the rest of the per-app mutation endpoints — the
+    owner, any collaborator, and any admin can fetch the file. We don't
+    expose this publicly because the export includes the canonical
+    description / category set as the owner curated them, which can
+    differ from the localised public listing and may name a contact
+    email the owner doesn't want scraped from an open endpoint.
+
+    Returns ``text/yaml`` with a ``Content-Disposition: attachment``
+    header so the browser saves it as ``<package>.yml`` rather than
+    rendering it inline. The content is generated by
+    :func:`services.fdroid_metadata.serialize_metadata_yaml`, which
+    handles the canonical field order, literal-block ``Description``
+    and the binary-only ``Builds[]`` shape pointing at this repo's
+    APK URLs.
+    """
+    from app.models.repo_config import RepoConfig
+    from app.services.app_permissions import assert_can_manage_app
+    from app.services.fdroid_metadata import serialize_metadata_yaml
+
+    app = await _load_app_or_404(db, str(app_id))
+    await assert_can_manage_app(db, user, app)
+    repo_config = (await db.execute(select(RepoConfig).limit(1))).scalar_one_or_none()
+    body = serialize_metadata_yaml(app, repo_config=repo_config)
+    # ``filename*=utf-8''…`` is the RFC 6266 form — supports non-ASCII
+    # package names. Standard package ids are ASCII-only in practice
+    # but the encoding is cheap and future-proof.
+    safe_name = app.package_name.replace('"', "")
+    return Response(
+        content=body,
+        media_type="text/yaml; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}.yml"',
+            # Caches must not collapse this across users — the file is
+            # gated on owner / collab membership.
+            "Cache-Control": "private, no-store",
+        },
+    )
+
+
+async def _require_owner_or_admin(db, app_id: uuid.UUID, user: User) -> App:
+    """Despite the historical name, this now accepts co-maintainers too —
+    the helper is used by listing-edit endpoints (localizations,
+    screenshots, banners) where collaborators have full rights.
+    """
+    from app.services.app_permissions import assert_can_manage_app
+
+    app = await _load_app_or_404(db, str(app_id))
+    await assert_can_manage_app(db, user, app)
+    return app
+
+
+@router.put("/{app_id}/localizations/{locale}", response_model=LocalizationRead)
+async def upsert_localization(
+    app_id: uuid.UUID,
+    locale: str,
+    payload: LocalizationUpsert,
+    db: DbSession,
+    user: Annotated[User, Depends(get_current_uploader)],
+) -> LocalizationRead:
+    """Create or replace a per-locale override row.
+
+    ``locale`` is a BCP47 tag like ``fr-FR``. At least one of the payload
+    fields must be non-null — an empty PUT means "delete me", so we ask the
+    caller to use DELETE instead.
+    """
+    if not _LOCALE_RE.fullmatch(locale):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Locale must look like 'en' or 'en-US' (BCP47).",
+        )
+    if not any(
+        getattr(payload, f) is not None and getattr(payload, f) != ""
+        for f in ("name", "summary", "description", "video")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="At least one of name / summary / description / video must be set.",
+        )
+    app = await _require_owner_or_admin(db, app_id, user)
+    existing = next((loc for loc in app.localizations if loc.locale == locale), None)
+    if existing is None:
+        row = Localization(
+            app_id=app.id,
+            locale=locale,
+            name=payload.name,
+            summary=payload.summary,
+            description=payload.description,
+            video=payload.video,
+        )
+        db.add(row)
+    else:
+        existing.name = payload.name
+        existing.summary = payload.summary
+        existing.description = payload.description
+        existing.video = payload.video
+        row = existing
+    await db.flush()
+    await enqueue_reindex()
+    return LocalizationRead.model_validate(row)
+
+
+@router.delete(
+    "/{app_id}/localizations/{locale}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_class=Response,
+)
+async def delete_localization(
+    app_id: uuid.UUID,
+    locale: str,
+    db: DbSession,
+    user: Annotated[User, Depends(get_current_uploader)],
+) -> None:
+    if not _LOCALE_RE.fullmatch(locale):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Bad locale")
+    app = await _require_owner_or_admin(db, app_id, user)
+    target = next((loc for loc in app.localizations if loc.locale == locale), None)
+    if target is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Not found")
+    await db.delete(target)
+    await db.flush()
+    await enqueue_reindex()

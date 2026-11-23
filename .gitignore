@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+.next/
+out/
+.turbo/
+*.tsbuildinfo
+next-env.d.ts
+
+# Env / secrets
+.env
+.env.local
+.env.*.local
+*.local
+
+# Repo data (managed at runtime). Anchored so they only match the
+# top-level runtime dirs — an unanchored ``storage/`` here used to
+# silently swallow ``backend/app/storage/`` (the actual source package),
+# producing a container that crashed on import.
+/data/
+/storage/
+/keystores/
+
+# Editor
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Build artifacts
+dist/
+build/
+coverage/
+*.log
+.remember
+
+# Knowledge graph (regenerable via `graphify update .`)
+graphify-out/
